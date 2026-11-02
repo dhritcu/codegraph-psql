@@ -43,6 +43,7 @@ import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-syn
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { hasTauriPattern, tauriEdges } from './tauri-synthesizer';
+import { pgTriggerEdges } from './pg-trigger-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
@@ -5318,6 +5319,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
   if (/\.go$/.test(filePath)) return true;
+  if (/\.(?:sql|psql|pgsql)$/i.test(filePath) && /\b(?:trigger|insert|update|delete|merge)\b/i.test(content)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content) || hasTauriPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
@@ -5437,6 +5439,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'angularTemplateEdges', gate: (has) => has('typescript'), run: (_q, c, y) => angularTemplateEdges(c, y) },
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
+  { name: 'pgTriggerEdges', gate: (has) => has('postgres'), run: (q, c, y) => pgTriggerEdges(q, c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
 ];
 
