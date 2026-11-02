@@ -78,6 +78,27 @@ describe('PostgreSQL routine bodies', () => {
     ]);
   });
 
+  it('reads a table whose name a variable or parameter shares wherever a table is written', () => {
+    const source = [
+      'CREATE FUNCTION sync_orders(items int) RETURNS void LANGUAGE plpgsql AS $$',
+      'DECLARE',
+      '  orders int;',
+      'BEGIN',
+      '  SELECT count(*) INTO orders FROM orders;',
+      '  INSERT INTO orders (n) VALUES (orders);',
+      '  UPDATE items SET n = orders;',
+      '  DELETE FROM orders WHERE n = items;',
+      'END $$;',
+    ].join('\n');
+    expect(refs(source)).toEqual([
+      'public::sync_orders calls public::count 5:9',
+      'public::sync_orders references public::orders 5:35 select',
+      'public::sync_orders references public::orders 6:14 insert',
+      'public::sync_orders references public::items 7:9 update',
+      'public::sync_orders references public::orders 8:14 delete',
+    ]);
+  });
+
   it('invents nothing for dynamic SQL', () => {
     const source = [
       'CREATE FUNCTION purge(tbl text) RETURNS void LANGUAGE plpgsql AS $$',
