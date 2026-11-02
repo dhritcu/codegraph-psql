@@ -96,14 +96,14 @@ language's paradigm as a model: `rust.ts`/`scala.ts` (functional, traits),
 
 These are exact, fragile wiring — match the existing style precisely:
 
-1. **`src/types.ts`** — TWO edits:
-   - add `'<lang>',` to the `LANGUAGES` const (before `'unknown'`);
-   - add `'**/*.<ext>',` to `DEFAULT_CONFIG.include`. **Don't skip this** — it's
-     the file-scan allowlist; without the glob, `codegraph init` finds **0
-     files** even though detection/extraction are wired.
+1. **`src/types.ts`**: add `'<lang>',` to the `LANGUAGES` const (before
+   `'unknown'`).
 2. **`src/extraction/grammars.ts`** — three maps:
    - `WASM_GRAMMAR_FILES`: `<lang>: 'tree-sitter-<lang>.wasm',`
-   - `EXTENSION_MAP`: each file extension → `'<lang>'` (e.g. `'.lua': 'lua',`)
+   - `EXTENSION_MAP`: each file extension → `'<lang>'` (e.g. `'.lua': 'lua',`).
+     **Don't skip this.** `isSourceFile` reads it as the file-scan allowlist;
+     without the entry, `codegraph init` finds **0 files** even though
+     detection and extraction are wired.
    - `getLanguageDisplayName`: `<lang>: '<Display Name>',`
    - **vendored only**: add `<lang>` to the
      `(lang === 'pascal' || lang === 'scala' || …)` wasm-path branch.
@@ -126,6 +126,12 @@ nests declared names (e.g. Lua's `variable_declaration → variable_list`), add 
 `} else if (this.language === '<lang>')` branch there, mirroring the existing
 ts/python/go ones. Import forms that aren't a distinct node (Lua/Ruby `require`
 is a *call*) are handled in the extractor's `visitNode` hook instead.
+
+**Kernel-routed languages.** Languages in `DEFAULT_ROUTED`
+(`src/extraction/kernel/index.ts`) extract through the Rust kernel by default,
+not the TS extractor. TypeScript and JavaScript are among them, so an extraction
+change for those languages also lands in `codegraph-kernel/src/tsjs/`. A new
+language is not in the set and stays on the wasm path.
 
 ### Step 5 — Build + verify loop
 
