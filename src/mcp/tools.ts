@@ -57,7 +57,7 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
-import { crossFileSqlMembers, dropSite, droppedSqlObjects, isSqlNode, liveSqlDefinitions, sqlCallerRows, sqlDroppedAt, sqlEdgeOps, sqlObjectsNamed, sqlOpTags, sqlTableSummary, writePathTables } from '../graph/sql-surface';
+import { crossFileSqlMembers, dropSite, droppedSqlObjects, isSqlNode, liveSqlDefinitions, sqlCallerRows, sqlDeclaration, sqlDroppedAt, sqlEdgeOps, sqlHistoryNote, sqlObjectsNamed, sqlOpTags, sqlTableSummary, sqlTableWritePath, writePathTables } from '../graph/sql-surface';
 import { describeTableAccess } from '../graph/sql-flow';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
@@ -3927,6 +3927,10 @@ export class ToolHandler {
       const out: string[] = [];
       if (hasMain) {
         out.push('**Flow (call path among the symbols you queried)**', '');
+        const history = best!.map((step) => sqlHistoryNote(cg, step.node));
+        if (history.some((note) => note !== null)) {
+          out.push('> This path no longer runs once every migration applies: the hops marked below were dropped or redefined by a later migration.', '');
+        }
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
           if (step.edge) {
@@ -3934,7 +3938,7 @@ export class ToolHandler {
             const label = this.synthEdgeNote(step.edge) ?? describeTableAccess(step.edge, step.node) ?? step.edge.kind;
             out.push(`   ↓ ${label}${when ? ` (when ${when})` : ''}`);
           }
-          out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
+          out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})${history[i] ? ` — ${history[i]}` : ''}`);
         }
         out.push('');
       }
@@ -4248,11 +4252,12 @@ export class ToolHandler {
    * operation, so "what happens when X is inserted" is answered without opening
    * the migrations. Tables the query names come first; '' when none qualify.
    */
-  private buildSqlTablesSection(cg: CodeGraph, subgraph: Subgraph, query: string): string {
+  private buildSqlTablesSection(cg: CodeGraph, subgraph: Subgraph, query: string): { text: string; bodies: Node[] } {
     const MAX_TABLES = 3;
+    const none = { text: '', bodies: [] };
     const found = [...subgraph.nodes.values()];
     const named = sqlObjectsNamed(cg, query);
-    if (named.length === 0 && !found.some(isSqlNode)) return '';
+    if (named.length === 0 && !found.some(isSqlNode)) return none;
     const words = new Set(query.toLowerCase().split(/[^a-z0-9_$]+/));
     const candidates = new Map<string, Node>();
     const add = (n: Node) => { if (n.kind === 'class' && isSqlNode(n)) candidates.set(n.id, n); };
@@ -4262,16 +4267,70 @@ export class ToolHandler {
     found.forEach((n) => writePathTables(cg, n).forEach(add));
     found.forEach(add);
     const blocks: string[] = [];
+    const bodies = new Map<string, Node>();
     for (const table of candidates.values()) {
       if (blocks.length === MAX_TABLES) break;
-      const block = sqlTableSummary(cg, table);
-      if (block && block.includes('\n')) blocks.push(block);
+      const path = sqlTableWritePath(cg, table);
+      if (!path || !path.summary.includes('\n')) continue;
+      blocks.push(path.summary);
+      for (const body of path.bodies) bodies.set(body.id, body);
     }
     // A routine or trigger the query names that a later migration dropped reads
     // as gone, never as code that still runs.
     const dropped = droppedSqlObjects(cg, [...named, ...found.filter((n) => words.has(n.name.toLowerCase()))]);
     if (dropped.length > 0) blocks.push(`**Dropped by later migrations:** ${dropped.join(', ')}`);
-    return blocks.length > 0 ? `${blocks.join('\n\n')}\n` : '';
+    if (blocks.length === 0) return none;
+    return { text: `${blocks.join('\n\n')}\n`, bodies: [...bodies.values()] };
+  }
+
+  /**
+   * Hands a table's write path the source budget first: the live trigger
+   * functions and the writers that fire them lead the ranked files, funded as
+   * exact targets, and a routine or trigger a later migration dropped or
+   * redefined leaves the ranking, named in the returned lines instead of
+   * printed, since its body no longer runs.
+   */
+  private focusSqlWritePath(
+    cg: CodeGraph,
+    sortedFiles: Array<[string, { nodes: Node[]; score: number; peripheral: number }]>,
+    fileGroups: Map<string, { nodes: Node[]; score: number; peripheral: number }>,
+    bodies: readonly Node[],
+    exactNodeIds: Set<string>,
+  ): string[] {
+    const MAX_BODIES = 6;
+    const omitted = new Map<string, Node>();
+    for (let i = sortedFiles.length - 1; i >= 0; i--) {
+      const [fp, group] = sortedFiles[i]!;
+      if (!group.nodes.some(isSqlNode)) continue;
+      group.nodes = group.nodes.filter((n) => {
+        if (!isSqlNode(n) || (n.kind !== 'function' && n.kind !== 'method')) return true;
+        const note = sqlHistoryNote(cg, n);
+        if (note) omitted.set(n.id, n);
+        return !note;
+      });
+      if (group.nodes.length === 0) {
+        sortedFiles.splice(i, 1);
+        fileGroups.delete(fp);
+      }
+    }
+    const top = sortedFiles[0]?.[1].score ?? 0;
+    const lead: Array<[string, { nodes: Node[]; score: number; peripheral: number }]> = [];
+    for (const body of bodies.slice(0, MAX_BODIES)) {
+      let group = fileGroups.get(body.filePath);
+      if (!group) {
+        group = { nodes: [], score: top, peripheral: 0 };
+        fileGroups.set(body.filePath, group);
+      }
+      group.score = Math.max(group.score, top);
+      if (!group.nodes.some((n) => n.id === body.id)) group.nodes.unshift(body);
+      exactNodeIds.add(body.id);
+      if (!lead.some(([fp]) => fp === body.filePath)) lead.push([body.filePath, group]);
+    }
+    const rest = sortedFiles.filter(([fp]) => !lead.some(([l]) => l === fp));
+    sortedFiles.splice(0, sortedFiles.length, ...lead, ...rest);
+    return [...omitted.values()]
+      .sort((a, b) => a.filePath.localeCompare(b.filePath, 'en', { numeric: true }) || a.startLine - b.startLine)
+      .map((n) => `${n.name}: \`${sqlDeclaration(n)}\`, declared ${n.filePath}:${n.startLine}, ${sqlHistoryNote(cg, n)}`);
   }
 
   /**
@@ -5499,7 +5558,7 @@ export class ToolHandler {
     if (blastRadius) lines.push(blastRadius);
 
     const sqlTables = this.buildSqlTablesSection(cg, subgraph, query);
-    if (sqlTables) lines.push(sqlTables);
+    if (sqlTables.text) lines.push(sqlTables.text);
 
     // Relationship map — show how symbols connect
     const significantEdges = subgraph.edges.filter(e =>
@@ -5544,6 +5603,7 @@ export class ToolHandler {
     // is synchronous, so the grammars it needs are loaded here, once.
     await warmBranchGuardGrammars();
     const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
+    const sqlOmitted = sqlTables.text ? this.focusSqlWritePath(cg, sortedFiles, fileGroups, sqlTables.bodies, exactNodeIds) : [];
 
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);
@@ -5692,6 +5752,10 @@ export class ToolHandler {
     const verbatimHeaderIdx = lines.length;
     lines.push('> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.');
     lines.push('');
+    if (sqlOmitted.length > 0) {
+      lines.push(`> Not printed, because a later migration dropped or redefined them and their bodies no longer run:\n${sqlOmitted.map((o) => `> - ${o}`).join('\n')}`);
+      lines.push('');
+    }
 
     // The response's absolute cap. It MUST stay under the host's inline
     // tool-result limit (~25K chars): above it the result is externalized to a

@@ -38,7 +38,7 @@ import { isTestFile, splitAtCjkSwitches, isQueryNameToken } from '../search/quer
 
 import { qualifiedSymbolMatches } from './symbol-lookup';
 import { goPackageReaderFor } from './go-package';
-import { sqlFlow, sqlTablesOf, type TableEnd } from './sql-flow';
+import { preferLiveSqlChains, sqlFlow, sqlTablesOf, type TableEnd } from './sql-flow';
 
 // Preserve the existing imports while sharing the matcher with the CLI and MCP.
 export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
@@ -716,13 +716,14 @@ export function resolveNamedSymbolFlow(
 
     if (found.length === 0) return flow;
     found.sort((a, b) => (directed ? a.length - b.length : b.length - a.length));
+    const ranked = preferLiveSqlChains(cg, found);
 
     // Identical chains, and chains that are just a shorter run along one
     // already kept, are the same answer twice: `a → b → c` and `b → c` differ
     // only in where the seed happened to be. Alternatives are for genuinely
     // different routes — a second overload, a different intermediate.
     const kept: string[] = [];
-    for (const steps of found) {
+    for (const steps of ranked) {
       const key = steps.map((s) => s.node.id).join('>');
       if (kept.some((other) => other === key || other.includes(key))) continue;
       kept.push(key);
