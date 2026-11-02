@@ -607,5 +607,31 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "postgres": [
+    {
+      "name": "storage",
+      "repo": "https://github.com/supabase/storage",
+      "sha": "7a39b19dedd426aca7c3639533d7f84aa605b4b8",
+      "size": "Small",
+      "files": "~840 (114 .sql)",
+      "question": "What happens in the database when a row in storage.objects is deleted? Trace from the objects table through its triggers to the functions they execute, such as storage.objects_delete_cleanup."
+    },
+    {
+      "name": "cal.com",
+      "repo": "https://github.com/calcom/cal.com",
+      "sha": "81ce067c1d0e16b21c39c2de98b9a43a92562cd1",
+      "size": "Medium",
+      "files": "~600 .sql (packages/prisma/migrations)",
+      "question": "Which tables does a Booking row point at through its foreign keys, and which tables point back at Booking? Trace from the Booking table across the Prisma migrations to User, EventType, and Attendee."
+    },
+    {
+      "name": "supabase",
+      "repo": "https://github.com/supabase/supabase",
+      "sha": "b98eca75c70e335b1f1ca3187c46826cc15dd2b2",
+      "size": "Large",
+      "files": "~18000 (111 .sql)",
+      "question": "How does a new auth user get a row in public.profiles in the user-management examples? Trace from the trigger on auth.users to the handle_new_user function it executes and the profiles table that function writes."
+    }
   ]
 }
