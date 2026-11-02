@@ -273,7 +273,7 @@ describe('SQL functions across migrations', () => {
 describe('a SQL table\'s write path', () => {
   const ORDERS = [
     '**SQL table `public::orders`** (migrations/001_schema.sql:26): 5 columns',
-    '- Triggers (2):',
+    '- Triggers (2, all live triggers as of the last migration, migrations/004_audit.sql):',
     '  - orders_audit AFTER INSERT → log_order_insert (migrations/004_audit.sql:8), declared migrations/004_audit.sql:16',
     '  - orders_touch BEFORE UPDATE → touch_updated_at (migrations/002_functions.sql:1), declared migrations/002_functions.sql:9',
     '- insert: create_order (migrations/002_functions.sql:18) fires orders_audit',
@@ -331,7 +331,7 @@ describe('a SQL table\'s write path', () => {
     try {
       expect(await tool(cg, 'codegraph_node', { symbol: 'public::notes' })).toContain([
         '**SQL table `public::notes`** (migrations/001_init.sql:1): 2 columns',
-        '- Triggers (1):',
+        '- Triggers (1, all live triggers as of the last migration, migrations/002_drop.sql):',
         '  - notes_stamp BEFORE INSERT OR UPDATE OF body → stamp (migrations/001_init.sql:2), declared migrations/001_init.sql:4',
         '- insert: add_note (migrations/001_init.sql:3) fires notes_stamp',
         '- Dropped triggers: notes_old (declared migrations/001_init.sql:5, dropped migrations/002_drop.sql:2)',
@@ -361,7 +361,7 @@ describe('SQL objects a later migration drops', () => {
   };
   const BLOCK = [
     '**SQL table `storage::objects`** (migrations/001_objects.sql:2): 2 columns',
-    '- Triggers (1):',
+    '- Triggers (1, all live triggers as of the last migration, migrations/004_drop.sql):',
     '  - protect_objects_delete BEFORE DELETE → protect_delete (migrations/003_guard.sql:1), declared migrations/003_guard.sql:2',
     '- delete: objects_cleanup (migrations/002_cleanup.sql:1, dropped migrations/004_drop.sql:2)',
     '- Dropped triggers: objects_cleanup (declared migrations/002_cleanup.sql:2, dropped migrations/004_drop.sql:1)',

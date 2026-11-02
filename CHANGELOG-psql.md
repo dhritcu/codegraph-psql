@@ -11,9 +11,13 @@ Changes in the codegraph-psql fork. Upstream's changes are in `CHANGELOG.md`.
 - `codegraph_explore` follows a SQL write through the table it touches into the trigger it fires, and a flow can end at a table you name, with the operation (`insert into orders`) and the trigger's timing and event on each hop.
 - `codegraph node`, `codegraph callers` and `codegraph impact` name what each function does to a table (`[insert]`), list columns and triggers that later migrations add as members of their table, and show only the live definition of a view or function that migrations redefine.
 - The viewer colors SQL keywords and names a missing table without an internal operation prefix.
+- When `codegraph_explore` shows a SQL table, its source section leads with the live trigger functions and the functions that fire them, and names bodies a later migration dropped or redefined instead of printing them.
+- A SQL table's trigger list now says it is complete as of the last migration, so you don't have to check later migrations for more.
 
 ### Fixes
 
+- A `codegraph_explore` flow through SQL functions or triggers that a later migration dropped or redefined now marks each such hop, and prefers a path that still runs.
+- A write a migration runs in a `DO` block now lists as `DO block in <file>:<line>` instead of as the bare file.
 - Telemetry is now off by default, so the fork sends no usage data unless you turn it on with `codegraph telemetry on`.
 - `codegraph install` and `codegraph upgrade` no longer offer the CodeGraph Pro waitlist.
 - `codegraph upgrade` now refuses outside a source checkout instead of replacing the fork with upstream CodeGraph, and prints how to update the fork.

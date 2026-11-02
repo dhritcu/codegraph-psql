@@ -17,7 +17,7 @@
 import type CodeGraph from '../index';
 import type { Edge, Node } from '../types';
 import type { FlowStep } from './named-symbol-flow';
-import { isSqlNode, sqlEdgeOp } from './sql-surface';
+import { isSqlNode, sqlEdgeOp, sqlHistoryNote } from './sql-surface';
 
 /** One route of the walk, as `named-symbol-flow` keeps it in its parent map. */
 interface RouteStep extends FlowStep {
@@ -147,4 +147,15 @@ export function sqlFlow(cg: CodeGraph, tables: ReadonlyMap<string, Node>): SqlFl
       return out;
     },
   };
+}
+
+/**
+ * Chains in the order the walk ranked them, those whose every SQL hop still
+ * runs once every migration applies first: a path through a dropped trigger
+ * or a superseded function is history, kept only when no live one connects.
+ */
+export function preferLiveSqlChains(cg: CodeGraph, chains: FlowStep[][]): FlowStep[][] {
+  if (!chains.some((steps) => steps.some((s) => isSqlNode(s.node)))) return chains;
+  const dead = new Map(chains.map((steps) => [steps, steps.some((s) => sqlHistoryNote(cg, s.node) !== null)]));
+  return [...chains].sort((a, b) => Number(dead.get(a)) - Number(dead.get(b)));
 }

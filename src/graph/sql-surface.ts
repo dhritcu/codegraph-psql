@@ -227,21 +227,32 @@ function dropsIn(file: string, text: string): SqlDrop[] {
   return out;
 }
 
-const dropCache = new WeakMap<CodeGraph, { stamp: string; drops: Map<string, SqlDrop[]> }>();
+interface SqlFileFacts {
+  drops: Map<string, SqlDrop[]>;
+  /** Each migration series' last file in apply order. */
+  lastFile: Map<string, string>;
+}
+
+const factsCache = new WeakMap<CodeGraph, { stamp: string; facts: SqlFileFacts }>();
 
 /**
- * Every DROP the indexed SQL files run, by what it ends; read once per index
- * revision. The revision is one aggregate query, where listing the files to
- * stamp them cost more than the rest of an explore call.
+ * Every DROP the indexed SQL files run, by what it ends, and the last file of
+ * each migration series; read once per index revision. The revision is one
+ * aggregate query, where listing the files to stamp them cost more than the
+ * rest of an explore call.
  */
-function sqlDrops(cg: CodeGraph): Map<string, SqlDrop[]> {
+function sqlFileFacts(cg: CodeGraph): SqlFileFacts {
   const { lastIndexedAt, fileCount } = cg.getIndexRevision();
   const stamp = `${lastIndexedAt}:${fileCount}`;
-  const cached = dropCache.get(cg);
-  if (cached?.stamp === stamp) return cached.drops;
+  const cached = factsCache.get(cg);
+  if (cached?.stamp === stamp) return cached.facts;
   const drops = new Map<string, SqlDrop[]>();
+  const lastFile = new Map<string, string>();
   const root = cg.getProjectRoot();
   for (const f of cg.getFiles().filter((file) => SQL_FILE.test(file.path))) {
+    const series = migrationSeries(f.path);
+    const last = lastFile.get(series);
+    if (last === undefined || naturalOrder(f.path, last) > 0) lastFile.set(series, f.path);
     let text: string;
     try {
       text = fs.readFileSync(path.join(root, f.path), 'utf-8');
@@ -250,9 +261,12 @@ function sqlDrops(cg: CodeGraph): Map<string, SqlDrop[]> {
     }
     for (const drop of dropsIn(f.path, text)) drops.set(drop.what, [...(drops.get(drop.what) ?? []), drop]);
   }
-  dropCache.set(cg, { stamp, drops });
-  return drops;
+  const facts = { drops, lastFile };
+  factsCache.set(cg, { stamp, facts });
+  return facts;
 }
+
+const sqlDrops = (cg: CodeGraph) => sqlFileFacts(cg).drops;
 
 /** The first DROP of any of `whats` that runs after `node` in its migration series. */
 function droppedAfter(drops: Map<string, SqlDrop[]>, node: Node, whats: readonly string[]): SqlDrop | null {
@@ -452,6 +466,14 @@ export function writePathTables(cg: CodeGraph, node: Node): Node[] {
     n.kind === 'class' && isSqlNode(n) && (!isTrigger(node) || node.qualifiedName.startsWith(`${n.qualifiedName}::`)));
 }
 
+/** The live trigger functions and writers whose bodies answer what a write to a table runs. */
+export interface SqlWritePath {
+  /** The table's block, as the table summary prints it. */
+  summary: string;
+  /** Each live trigger's function, then each live writer that fires a live trigger, in that order. */
+  bodies: Node[];
+}
+
 /**
  * What a reader asking about a table's write path wants in one block: its
  * columns, its live triggers with the function each runs, the functions that
@@ -460,18 +482,28 @@ export function writePathTables(cg: CodeGraph, node: Node): Node[] {
  * SQL table or view.
  */
 export function sqlTableSummary(cg: CodeGraph, table: Node): string | null {
+  return sqlTableWritePath(cg, table)?.summary ?? null;
+}
+
+export function sqlTableWritePath(cg: CodeGraph, table: Node): SqlWritePath | null {
   if (table.kind !== 'class' || !isSqlNode(table)) return null;
   const incoming = cg.getIncomingEdges(table.id);
   const members = [...cg.getChildren(table.id), ...crossFileSqlMembers(cg, table, incoming)];
   const columns = new Set(members.filter((m) => m.kind === 'field').map((m) => m.name)).size;
-  const drops = sqlDrops(cg);
+  const { drops, lastFile } = sqlFileFacts(cg);
   const { live, dropped } = tableTriggers(cg, table, members, drops);
   const lines = [`**SQL table \`${table.qualifiedName}\`** (${at(table)}): ${columns} column${columns === 1 ? '' : 's'}`];
+  const bodies = new Map<string, Node>();
 
-  if (live.length > 0) lines.push(`- Triggers (${live.length}):`);
+  if (live.length > 0 || dropped.length > 0) {
+    const last = lastFile.get(migrationSeries(table.filePath));
+    const asOf = `as of the last migration${last ? `, ${last}` : ''}`;
+    lines.push(live.length > 0 ? `- Triggers (${live.length}, all live triggers ${asOf}):` : `- Triggers: none live ${asOf}`);
+  }
   for (const t of live) {
-    const fn = t.fn ? ` → ${t.fn.name} (${at(t.fn)})` : '';
-    lines.push(`  - ${t.node.name} ${t.when}${fn}, declared ${at(t.node)}`);
+    const fn = t.fn ? liveSqlDefinitionOf(cg, t.fn) : null;
+    if (fn && !droppedWith(cg, drops, fn)) bodies.set(fn.id, fn);
+    lines.push(`  - ${t.node.name} ${t.when}${fn ? ` → ${fn.name} (${at(fn)})` : ''}, declared ${at(t.node)}`);
   }
 
   const liveNames = new Set(live.map((t) => t.node.qualifiedName));
@@ -494,11 +526,14 @@ export function sqlTableSummary(cg: CodeGraph, table: Node): string | null {
   for (const op of [...SQL_OPS].filter((o) => byOp.has(o))) {
     const writers = byOp.get(op)!;
     const nodes = liveSqlDefinitions(cg, [...writers.keys()].map((id) => writerNodes.get(id)).filter((n): n is Node => !!n), drops).nodes;
-    const entries = nodes.map((writer) => {
-      const drop = droppedWith(cg, drops, writer);
-      if (drop) return `${writer.name} (${at(writer)}, dropped ${dropSite(drop)})`;
+    const entries = nodes.flatMap((writer) => {
       const fires = [...new Set(firedBy.get(writer.id) ?? [])];
-      return `${writer.name} (${at(writer)})${fires.length > 0 ? ` fires ${fires.join(', ')}` : ''}`;
+      const firing = fires.length > 0 ? ` fires ${fires.join(', ')}` : '';
+      if (writer.kind === 'file') return topLevelWrites(cg, writer, writers.get(writer.id) ?? []).map((w) => `${w}${firing}`);
+      const drop = droppedWith(cg, drops, writer);
+      if (drop) return [`${writer.name} (${at(writer)}, dropped ${dropSite(drop)})`];
+      if (fires.length > 0) bodies.set(writer.id, writer);
+      return [`${writer.name} (${at(writer)})${firing}`];
     });
     lines.push(`- ${op}: ${listed(entries)}`);
   }
@@ -511,7 +546,72 @@ export function sqlTableSummary(cg: CodeGraph, table: Node): string | null {
   if (dropped.length > 0) {
     lines.push(`- Dropped triggers: ${listed(dropped.map((d) => `${d.node.name} (declared ${at(d.node)}, dropped ${d.drop.file}:${d.drop.line})`))}`);
   }
-  return lines.join('\n');
+  return { summary: lines.join('\n'), bodies: [...bodies.values()] };
+}
+
+const DO_OPEN = /\bDO\s+(\$[A-Za-z_]*\$)/i;
+
+/**
+ * The writes a migration runs outside any function, one per statement:
+ * `DO block in a.sql:13` when an anonymous block holds it, `statement in
+ * a.sql:13` otherwise.
+ */
+function topLevelWrites(cg: CodeGraph, file: Node, edges: readonly Edge[]): string[] {
+  const lines = [...new Set(edges.map((e) => e.line ?? 1))].sort((a, b) => a - b);
+  let rows: string[] = [];
+  try {
+    rows = fs.readFileSync(path.join(cg.getProjectRoot(), file.filePath), 'utf-8').split(/\r?\n/);
+  } catch { /* named as a statement */ }
+  const inBlock = new Set<number>();
+  let tag: string | null = null;
+  for (let i = 0; i < rows.length && i < lines[lines.length - 1]!; i++) {
+    const row = rows[i]!;
+    if (tag === null) {
+      const open = DO_OPEN.exec(row);
+      if (open && !row.slice(open.index + open[0].length).includes(open[1]!)) tag = open[1]!;
+    } else if (row.includes(tag)) tag = null;
+    if (tag !== null) inBlock.add(i + 1);
+  }
+  return lines.map((line) => `${inBlock.has(line) ? 'DO block' : 'statement'} in ${file.filePath}:${line}`);
+}
+
+/**
+ * The definition of `node`'s object that stands once every migration applies:
+ * the latest copy of it, or of its overload still live when a DROP of its own
+ * signature ended it. `node` itself when it is no copy of anything.
+ */
+export function liveSqlDefinitionOf(cg: CodeGraph, node: Node): Node {
+  if (!isSqlNode(node)) return node;
+  const copies = cg.getNodesByName(node.name).filter((n) =>
+    isSqlNode(n) && n.kind === node.kind && n.qualifiedName === node.qualifiedName);
+  if (copies.length < 2) return node;
+  const live = liveSqlDefinitions(cg, copies).nodes.filter((n) => migrationSeries(n.filePath) === migrationSeries(node.filePath));
+  const sig = routineSignature(node);
+  return live.find((n) => routineSignature(n) === sig) ?? live[0] ?? node;
+}
+
+/**
+ * Why a SQL definition no longer runs once every migration applies:
+ * `dropped in b.sql:2` (it, or the later copy that replaced it, was dropped),
+ * `superseded by c.sql:22` (a later migration redefined it), or null while it
+ * is the live definition.
+ */
+export function sqlHistoryNote(cg: CodeGraph, node: Node): string | null {
+  if (!isSqlNode(node)) return null;
+  const live = liveSqlDefinitionOf(cg, node);
+  const drop = sqlDroppedAt(cg, live);
+  if (drop) return `dropped in ${dropSite(drop)}`;
+  return live.id === node.id ? null : `superseded by ${at(live)}`;
+}
+
+/** `storage.objects_delete_cleanup() RETURNS trigger`: how a SQL object is declared, without its body. */
+export function sqlDeclaration(node: Node): string {
+  const head = (node.signature ?? node.name)
+    .replace(/^\w+:\s*/, '')
+    .replace(/^create\s+(?:or\s+replace\s+)?(?:constraint\s+)?(?:function|procedure|trigger|view|table)\s+/i, '')
+    .replace(/\s+(?:language|as|security|immutable|stable|volatile)\b[\s\S]*$/i, '')
+    .replace(/\s+/g, ' ');
+  return head.length > 120 ? `${head.slice(0, 117)}...` : head;
 }
 
 const SQL_PATH_TOKEN = /^"?[A-Za-z_][\w$]*"?(?:\.|::)"?[A-Za-z_][\w$]*"?$/;
