@@ -305,6 +305,8 @@ export interface IndexHealth {
    * they stay this way until the file (or the parser) changes.
    */
   parseErrors: string[];
+  /** Files over the size limit, stored without being parsed. */
+  skippedForSize: string[];
 }
 
 // =============================================================================

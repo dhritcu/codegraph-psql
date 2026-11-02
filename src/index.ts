@@ -2956,8 +2956,13 @@ export class CodeGraph {
   getIndexHealth(): IndexHealth {
     const needsReindex: string[] = [];
     const parseErrors: string[] = [];
+    const skippedForSize: string[] = [];
     for (const file of this.queries.getFilesWithoutNodesOrWithErrors()) {
       const errors = file.errors ?? [];
+      if (errors.some((e) => e.code === 'size_exceeded')) {
+        skippedForSize.push(file.path);
+        continue;
+      }
       if (hasGrammarLoadFailure(errors)) {
         // Stored without being parsed — its grammar could not load (#2335).
         needsReindex.push(file.path);
@@ -2973,7 +2978,7 @@ export class CodeGraph {
         parseErrors.push(file.path);
       }
     }
-    return { needsReindex, parseErrors };
+    return { needsReindex, parseErrors, skippedForSize };
   }
 
   /**
