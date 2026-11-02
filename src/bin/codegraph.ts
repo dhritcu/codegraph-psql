@@ -71,7 +71,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
-import { sqlCallerRows, sqlEdgeOp, sqlOpTags } from '../graph/sql-surface';
+import { sqlCallerRows, sqlEdgeOp, sqlEdgeOps, sqlOpTags } from '../graph/sql-surface';
 import { goPackageReaderFor } from '../graph/go-package';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import { buildTypeHierarchy, canHaveHierarchy, MAX_DESCENDANTS, MAX_DESCENDANT_DEPTH } from '../graph/type-hierarchy';
@@ -2556,7 +2556,7 @@ for (const direction of ['callers', 'callees'] as const) {
             const recursive = new Set<string>();
             for (const target of group) {
               const rows = cg.getCallSites(target.id, direction);
-              for (const row of direction === 'callers' ? sqlCallerRows(target, rows) : rows) {
+              for (const row of direction === 'callers' ? sqlCallerRows(cg, target, rows) : rows) {
                 nodes.set(row.node.id, row.node);
                 if (row.recursive) recursive.add(row.node.id);
                 for (const edge of row.edges) {
@@ -2580,6 +2580,8 @@ for (const direction of ['callers', 'callees'] as const) {
           const row = (node: Node, edges: Edge[], recursive: boolean) => ({
             ...cliNode(node),
             relationships: relationships(node, edges),
+            // What a SQL caller does to a table: `["insert"]`. Absent for any other edge.
+            ...(sqlEdgeOps(ownEdges(node, edges)).length > 0 ? { ops: sqlEdgeOps(ownEdges(node, edges)) } : {}),
             lines: callSiteLines(ownEdges(node, edges)),
             recursive,
           });

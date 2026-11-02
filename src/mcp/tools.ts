@@ -57,7 +57,7 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
-import { crossFileSqlMembers, liveSqlDefinitions, sqlCallerRows, sqlEdgeOps, sqlOpTags } from '../graph/sql-surface';
+import { crossFileSqlMembers, isSqlNode, liveSqlDefinitions, sqlCallerRows, sqlEdgeOps, sqlOpTags, sqlTableSummary, writePathTables } from '../graph/sql-surface';
 import { describeTableAccess } from '../graph/sql-flow';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
@@ -3433,7 +3433,7 @@ export class ToolHandler {
       const sites = new Map<string, Edge[]>();
       const recursive = new Set<string>();
       for (const node of defNodes) {
-        for (const c of sqlCallerRows(node, cg.getCallSites(node.id, 'callers'))) {
+        for (const c of sqlCallerRows(cg, node, cg.getCallSites(node.id, 'callers'))) {
           const known = sites.get(c.node.id);
           if (known) {
             known.push(...c.edges);
@@ -4200,7 +4200,7 @@ export class ToolHandler {
     const entries: string[] = [];
     for (const root of roots) {
       let callers: Array<{ node: Node }> = [];
-      try { callers = cg.getCallers(root.id) as Array<{ node: Node }>; } catch { /* skip this root */ }
+      try { callers = sqlCallerRows(cg, root, cg.getCallers(root.id)); } catch { /* skip this root */ }
 
       const seen = new Set<string>();
       const uniq: Node[] = [];
@@ -4240,6 +4240,31 @@ export class ToolHandler {
       ...entries,
       '',
     ].join('\n');
+  }
+
+  /**
+   * The write path of the SQL tables an exploration found or whose writers it
+   * found: each table's triggers with the function they run, and its writers by
+   * operation, so "what happens when X is inserted" is answered without opening
+   * the migrations. Tables the query names come first; '' when none qualify.
+   */
+  private buildSqlTablesSection(cg: CodeGraph, subgraph: Subgraph, query: string): string {
+    const MAX_TABLES = 3;
+    const found = [...subgraph.nodes.values()];
+    if (!found.some(isSqlNode)) return '';
+    const words = new Set(query.toLowerCase().split(/[^a-z0-9_$]+/));
+    const candidates = new Map<string, Node>();
+    const add = (n: Node) => { if (n.kind === 'class' && isSqlNode(n)) candidates.set(n.id, n); };
+    found.filter((n) => words.has(n.name.toLowerCase())).forEach(add);
+    found.forEach((n) => writePathTables(cg, n).forEach(add));
+    found.forEach(add);
+    const blocks: string[] = [];
+    for (const table of candidates.values()) {
+      if (blocks.length === MAX_TABLES) break;
+      const block = sqlTableSummary(cg, table);
+      if (block && block.includes('\n')) blocks.push(block);
+    }
+    return blocks.length > 0 ? `${blocks.join('\n\n')}\n` : '';
   }
 
   /**
@@ -5465,6 +5490,9 @@ export class ToolHandler {
     // knows what to update/verify before editing without a separate call.
     const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
     if (blastRadius) lines.push(blastRadius);
+
+    const sqlTables = this.buildSqlTablesSection(cg, subgraph, query);
+    if (sqlTables) lines.push(sqlTables);
 
     // Relationship map — show how symbols connect
     const significantEdges = subgraph.edges.filter(e =>
@@ -8127,7 +8155,7 @@ export class ToolHandler {
 
     // One SQL object defined again by later migrations: the latest definition is
     // the live one, and the earlier ones are its history.
-    const sqlLive = liveSqlDefinitions(matches);
+    const sqlLive = liveSqlDefinitions(cg, matches);
     if (sqlLive.nodes.length === 1) {
       const live = sqlLive.nodes[0]!;
       const earlier = sqlLive.superseded.get(live.id) ?? [];
@@ -8465,7 +8493,8 @@ export class ToolHandler {
         code = await cg.getCode(node.id);
       }
     }
-    return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
+    const table = sqlTableSummary(cg, node);
+    return this.formatNodeDetails(node, code, outline) + (table ? `\n\n${table}\n` : '') + this.formatTrail(cg, node);
   }
 
   // Whole-file fallback caps for a drifted file (#1474): small enough to fit
@@ -8551,7 +8580,7 @@ export class ToolHandler {
     // symbol changes (#2909), and a symbol that calls itself is among its own
     // callers, once.
     const callees = cg.getCallSites(node.id, 'callees').filter((row) => !row.recursive);
-    const callers = sqlCallerRows(node, cg.getCallSites(node.id, 'callers'));
+    const callers = sqlCallerRows(cg, node, cg.getCallSites(node.id, 'callers'));
     if (callees.length === 0 && callers.length === 0) return '';
     const callee = (row: CallSiteRow) => fmt(row, `${row.node.filePath}:${row.node.startLine}`);
     const caller = (row: CallSiteRow) => {
