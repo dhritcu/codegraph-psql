@@ -145,6 +145,27 @@ function splitTopLevel(text: string): string[] {
   return out.map((p) => p.trim()).filter((p) => p.length > 0);
 }
 
+/**
+ * `s` with the text of every template literal blanked, offsets and newlines
+ * kept: a template holds sample code (a docs page's `supabase.from('todos')`)
+ * far more often than a query.
+ */
+function blankTemplates(s: string): string {
+  let out = '';
+  let copied = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch !== '"' && ch !== "'" && ch !== '`') continue;
+    const end = skipString(s, i);
+    if (ch === '`') {
+      out += s.slice(copied, i + 1) + s.slice(i + 1, end).replace(/[^\n]/g, ' ');
+      copied = end;
+    }
+    i = end;
+  }
+  return out + s.slice(copied);
+}
+
 /** The value of a string literal with no interpolation that opens `text`, else null. */
 function literal(text: string): string | null {
   const m = /^\s*(?:(['"])((?:(?!\1)[^\\\n])*)\1|`([^`\\$]*)`)/.exec(text);
@@ -241,13 +262,21 @@ function importsOf(ctx: ResolutionContext, file: string, safe: string): ImportMa
   return [...mapped, ...required];
 }
 
+/** The package a specifier names: `npm:@supabase/supabase-js@2`, `jsr:…` and `https://esm.sh/…@2` as Deno imports them. */
+function packageOf(source: string): string {
+  const bare = source.replace(/^(?:npm:|jsr:|https:\/\/(?:esm\.sh|cdn\.skypack\.dev|cdn\.jsdelivr\.net\/npm)\/)/, '');
+  const m = /^((?:@[^/@]+\/)?[^/@]+)(?:@[^/]*)?(\/.*)?$/.exec(bare);
+  return m ? m[1]! + (m[2] ?? '') : source;
+}
+
 /** The client a local name is a factory of, by the package it is imported from. */
 function factoryClient(imports: readonly ImportMapping[], local: string): Binding['client'] | null {
   for (const im of imports) {
     if (im.localName !== local) continue;
+    const pkg = packageOf(im.source);
     for (const [client, f] of Object.entries(FACTORIES) as [Binding['client'], (typeof FACTORIES)[Binding['client']]][]) {
-      const names = f.packages[im.source];
-      if (names && (names.includes(im.isDefault ? 'default' : im.exportedName) || (im.isDefault && names.includes(local)))) return client;
+      const names = f.packages[pkg];
+      if (names?.includes(im.isDefault ? 'default' : im.exportedName)) return client;
     }
   }
   return null;
@@ -275,8 +304,8 @@ function factoryCalls(safe: string, imports: readonly ImportMapping[]): { index:
 function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   const content = ctx.readFile(file);
   if (!content) return null;
-  const safe = stripCommentsForRegex(content, 'typescript');
-  const imports = importsOf(ctx, file, safe);
+  const safe = blankTemplates(stripCommentsForRegex(content, 'typescript'));
+  const imports = importsOf(ctx, file, safe).filter((im) => safe.includes(`'${im.source}'`) || safe.includes(`"${im.source}"`));
   const instances = new Map<string, Binding>();
   const factories = new Map<string, Binding>();
   const calls = factoryCalls(safe, imports);
@@ -285,7 +314,7 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
     const lineStarts = [0];
     for (let i = safe.indexOf('\n'); i !== -1; i = safe.indexOf('\n', i + 1)) lineStarts.push(i + 1);
     const nodes = ctx.getNodesInFile(file);
-    const bound = new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*(?::[^=;]*?)?=\s*(?:await\s+)?$`);
+    const bound = new RegExp(String.raw`(?:\b(?:const|let|var)\s+)?(?<![\w$.])(${IDENT})\s*(?::[^=;]*?)?=\s*(?:await\s+)?$`);
     const returned = /(?:\breturn|=>)\s*(?:await\s+)?$/;
     for (const call of calls) {
       const before = safe.slice(Math.max(0, call.index - 200), call.index);
@@ -314,8 +343,12 @@ function factsOf(ctx: ResolutionContext, file: string, cache: FactsCache): FileF
   return facts;
 }
 
-/** The client instances and factories a file can use: its own, and those it imports from the module that makes them. */
-function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): { instances: Map<string, Binding>; factories: Map<string, Binding> } {
+/**
+ * The receivers a file can query through, as regex sources: the client
+ * instances and factory calls (`supabaseAdmin()`) of its own, and of the
+ * module it imports them from.
+ */
+function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Map<string, Binding> {
   const instances = new Map(facts.instances);
   const factories = new Map(facts.factories);
   const lang = facts.file.endsWith('x') ? 'tsx' : 'typescript';
@@ -341,7 +374,10 @@ function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache):
       if (binding && !instances.has(m[1]!)) instances.set(m[1]!, binding);
     }
   }
-  return { instances, factories };
+  return new Map([
+    ...[...instances].map(([name, b]) => [escape(name), b] as const),
+    ...[...factories].map(([name, b]) => [String.raw`${escape(name)}\s*\(\s*\)`, b] as const),
+  ]);
 }
 
 // =============================================================================
@@ -378,9 +414,9 @@ function tableName(text: string, schema: string | null): { schema: string; name:
 
 const SUPABASE_OPS: Readonly<Record<string, Op>> = { select: 'select', insert: 'insert', update: 'update', upsert: 'insert', delete: 'delete' };
 
-function supabaseSites(safe: string, name: string, binding: Binding, out: Site[]): void {
+function supabaseSites(safe: string, receiver: string, binding: Binding, out: Site[]): void {
   const re = new RegExp(
-    String.raw`(?<![\w$.])${escape(name)}\s*(?:\??\.\s*schema\s*\(\s*(['"\`])([A-Za-z_][\w$]*)\1\s*\)\s*)?\??\.\s*(from|rpc)\s*(?:<[^()]*?>)?\s*\(`,
+    String.raw`(?<![\w$.])${receiver}\s*(?:\??\.\s*schema\s*\(\s*(['"\`])([A-Za-z_][\w$]*)\1\s*\)\s*)?\??\.\s*(from|rpc)\s*(?:<[^()]*?>)?\s*\(`,
     'g'
   );
   for (const m of safe.matchAll(re)) {
@@ -389,20 +425,22 @@ function supabaseSites(safe: string, name: string, binding: Binding, out: Site[]
     const value = literal(safe.slice(open + 1, close));
     if (!value) continue;
     const schema = m[2] ?? binding.schema ?? DEFAULT_SCHEMA;
+    const index = m.index! + m[0].lastIndexOf(m[3]!);
     const via = m[2] ? `.schema('${m[2]}')` : '';
     if (m[3] === 'rpc') {
       if (!/^[A-Za-z_][\w$]*$/.test(value)) continue;
-      out.push({ client: 'supabase', index: m.index!, call: `${via}.rpc('${value}')`, target: { kind: 'function', schema, name: value },
+      out.push({ client: 'supabase', index, call: `${via}.rpc('${value}')`, target: { kind: 'function', schema, name: value },
         ops: [], columns: null, upsert: false, declaration: false });
       continue;
     }
     const table = tableName(value, schema);
-    if (!table || value.includes(' ')) continue;
+    // PostgREST takes a bare table name; the schema comes from `.schema()` or the client.
+    if (!table || /[\s.]/.test(value)) continue;
     const link = chainAfter(safe, close + 1).find((l) => SUPABASE_OPS[l.method]);
     if (!link) continue;
     const upsert = link.method === 'upsert';
     const columns = link.method === 'update' || upsert ? payloadKeys(link.args[0]) : null;
-    out.push({ client: 'supabase', index: m.index!, call: `${via}.from('${value}').${link.method}`, target: { kind: 'table', ...table },
+    out.push({ client: 'supabase', index, call: `${via}.from('${value}').${link.method}`, target: { kind: 'table', ...table },
       ops: upsert ? ['insert', 'update'] : [SUPABASE_OPS[link.method]!], columns, upsert, declaration: false });
   }
 }
@@ -411,8 +449,8 @@ const KNEX_OPS: Readonly<Record<string, Op>> = {
   insert: 'insert', update: 'update', del: 'delete', delete: 'delete', increment: 'update', decrement: 'update',
 };
 
-function knexSites(safe: string, name: string, out: Site[]): void {
-  const re = new RegExp(String.raw`(?<![\w$.])${escape(name)}\s*(?:\.\s*(from|table|into)\s*)?(?:<[^()]*?>)?\s*\(`, 'g');
+function knexSites(safe: string, receiver: string, out: Site[]): void {
+  const re = new RegExp(String.raw`(?<![\w$.])${receiver}\s*(?:\.\s*(from|table|into)\s*)?(?:<[^()]*?>)?\s*\(`, 'g');
   for (const m of safe.matchAll(re)) {
     const open = m.index! + m[0].length - 1;
     const close = closeBracket(safe, open);
@@ -425,15 +463,15 @@ function knexSites(safe: string, name: string, out: Site[]): void {
     const ops: Op[] = write ? [KNEX_OPS[write.method]!] : ['select'];
     if (merge && ops[0] === 'insert') ops.push('update');
     const columns = write?.method === 'update' ? payloadKeys(write.args[0]) : merge ? payloadKeys(write?.args[0]) : null;
-    out.push({ client: 'knex', index: m.index!, call: `${m[1] ? `.${m[1]}` : ''}('${value}')${write ? `.${write.method}` : ''}`,
+    out.push({ client: 'knex', index: m[1] ? m.index! + m[0].lastIndexOf(m[1]) : m.index!, call: `${m[1] ? `.${m[1]}` : ''}('${value}')${write ? `.${write.method}` : ''}`,
       target: { kind: 'table', ...table }, ops, columns, upsert: merge, declaration: false });
   }
 }
 
 const KYSELY_OPS: Readonly<Record<string, Op>> = { selectFrom: 'select', insertInto: 'insert', updateTable: 'update', deleteFrom: 'delete' };
 
-function kyselySites(safe: string, name: string, out: Site[]): void {
-  const re = new RegExp(String.raw`(?<![\w$.])${escape(name)}\s*\.\s*(selectFrom|insertInto|updateTable|deleteFrom)\s*\(`, 'g');
+function kyselySites(safe: string, receiver: string, out: Site[]): void {
+  const re = new RegExp(String.raw`(?<![\w$.])${receiver}\s*\.\s*(selectFrom|insertInto|updateTable|deleteFrom)\s*\(`, 'g');
   for (const m of safe.matchAll(re)) {
     const open = m.index! + m[0].length - 1;
     const close = closeBracket(safe, open);
@@ -458,14 +496,14 @@ function kyselySites(safe: string, name: string, out: Site[]): void {
         columns = payloadKeys(conflict.slice(open2 + 1, closeBracket(conflict, open2)));
       }
     }
-    out.push({ client: 'kysely', index: m.index!, call: `.${method}('${value}')`, target: { kind: 'table', ...table },
+    out.push({ client: 'kysely', index: m.index! + m[0].lastIndexOf(method), call: `.${method}('${value}')`, target: { kind: 'table', ...table },
       ops, columns, upsert, declaration: false });
   }
 }
 
 function drizzleSites(facts: FileFacts, out: Site[]): void {
   const fromDrizzle = (exported: string): string[] =>
-    facts.imports.filter((im) => im.source === DRIZZLE_PACKAGE && im.exportedName === exported).map((im) => im.localName);
+    facts.imports.filter((im) => packageOf(im.source) === DRIZZLE_PACKAGE && im.exportedName === exported).map((im) => im.localName);
   const schemas = new Map<string, string>();
   for (const local of fromDrizzle('pgSchema')) {
     const re = new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*${escape(local)}\s*\(\s*(['"])([^'"]+)\2\s*\)`, 'g');
@@ -487,11 +525,10 @@ function drizzleSites(facts: FileFacts, out: Site[]): void {
 
 function sitesIn(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Site[] {
   const sites: Site[] = [];
-  const { instances } = receivers(ctx, facts, cache);
-  for (const [name, binding] of instances) {
-    if (binding.client === 'supabase') supabaseSites(facts.safe, name, binding, sites);
-    else if (binding.client === 'knex') knexSites(facts.safe, name, sites);
-    else kyselySites(facts.safe, name, sites);
+  for (const [receiver, binding] of receivers(ctx, facts, cache)) {
+    if (binding.client === 'supabase') supabaseSites(facts.safe, receiver, binding, sites);
+    else if (binding.client === 'knex') knexSites(facts.safe, receiver, sites);
+    else kyselySites(facts.safe, receiver, sites);
   }
   if (facts.safe.includes(DRIZZLE_PACKAGE)) drizzleSites(facts, sites);
   return sites;
@@ -513,19 +550,24 @@ function seriesOf(filePath: string): string {
   return dir.some((p) => /^migrations?$/i.test(p)) ? dir.join('/') : filePath;
 }
 
-function sharedDepth(a: string, b: string): number {
-  const pa = a.split('/');
-  const pb = b.split('/');
-  let n = 0;
-  while (n < pa.length - 1 && n < pb.length - 1 && pa[n] === pb[n]) n++;
-  return n;
+/**
+ * The directory of the project a migration series belongs to: the series path
+ * up to its `supabase/`, `migrations/`, `db/` … directory (`examples/todo` for
+ * `examples/todo/supabase/migrations`); a schema file's own directory.
+ */
+function projectRoot(series: string, isFile: boolean): string {
+  const parts = series.split('/');
+  if (isFile) parts.pop();
+  const at = parts.findIndex((p) => /^(?:supabase|migrations?|db|database|sql|schema|prisma)$/i.test(p));
+  return (at >= 0 ? parts.slice(0, at) : parts).join('/');
 }
 
 /**
  * The SQL object a client call names, as the database has it once every
- * migration ran. A repo may hold several schemas (an app per directory), so
- * the definitions nearest the calling file win; two equally near series or
- * files make the name ambiguous and yield nothing. Within one series the
+ * migration ran. A repo may hold several schemas (an app per directory): a
+ * definition counts only when its project directory contains the calling
+ * file, the deepest such project wins, and two series or files of equal depth
+ * make the name ambiguous and yield nothing. Within one series the
  * Postgres resolver picks the live definition, asked from a position after
  * the series' last migration.
  */
@@ -537,12 +579,17 @@ function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: stri
   let groups = new Set<string>();
   for (const d of defs) {
     const series = seriesOf(d.filePath);
-    const depth = sharedDepth(series === d.filePath ? d.filePath : `${series}/x`, fromFile);
+    const root = projectRoot(series, series === d.filePath);
+    if (root !== '' && !fromFile.startsWith(`${root}/`)) continue;
+    const depth = root === '' ? 0 : root.split('/').length;
     if (depth > best) {
       best = depth;
       groups = new Set([series]);
     } else if (depth === best) groups.add(series);
   }
+  // A migration series is the database; a schema file beside it is a snapshot of it.
+  const migrations = [...groups].filter((g) => !defs.some((d) => d.filePath === g));
+  if (groups.size > 1 && migrations.length === 1) groups = new Set(migrations);
   if (groups.size !== 1) return null;
   const [series] = groups as Set<string>;
   const isFile = defs.some((d) => d.filePath === series);
@@ -587,13 +634,22 @@ function hopEdge(from: Node, site: Site, target: Node, line: number, column: num
   };
 }
 
-/** Fold a later site's ops and columns into the edge an earlier site on the same pair made. */
-function mergeSite(edge: Edge, site: Site): void {
+/**
+ * Fold a later site's ops and columns into the edge an earlier site on the
+ * same pair made. The edge sits at its first write, where a trigger hop starts.
+ */
+function mergeSite(edge: Edge, site: Site, line: number, column: number): void {
   const m = edge.metadata as Record<string, unknown>;
   const ops = new Set([...((m.ops as Op[] | undefined) ?? []), ...site.ops]);
   if (ops.size === 0) return;
   m.ops = [...ops];
-  if (!m.op || m.op === 'select') m.op = [...ops].find((op) => op !== 'select') ?? 'select';
+  const write = site.ops.find((op) => op !== 'select');
+  if (write && (!m.op || m.op === 'select')) {
+    m.op = write;
+    m.call = site.call;
+    edge.line = line;
+    edge.column = column;
+  }
   if (site.upsert) m.upsert = true;
   if (site.columns) m.columns = [...new Set([...((m.columns as string[] | undefined) ?? []), ...site.columns])];
 }
@@ -652,11 +708,11 @@ export async function sqlClientEdges(queries: QueryBuilder, ctx: ResolutionConte
       if (!target) continue;
       const pair = `${from.id}>${target.id}`;
       const seen = byPair.get(pair);
+      const column = site.index - (facts.safe.lastIndexOf('\n', site.index - 1) + 1);
       if (seen) {
-        mergeSite(seen, site);
+        mergeSite(seen, site, line, column);
         continue;
       }
-      const column = site.index - (facts.safe.lastIndexOf('\n', site.index - 1) + 1);
       const edge = hopEdge(from, site, target, line, column);
       byPair.set(pair, edge);
       edges.push(edge);

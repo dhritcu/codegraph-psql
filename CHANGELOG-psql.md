@@ -13,6 +13,7 @@ Changes in the codegraph-psql fork. Upstream's changes are in `CHANGELOG.md`.
 - The viewer colors SQL keywords and names a missing table without an internal operation prefix.
 - When `codegraph_explore` shows a SQL table, its source section leads with the live trigger functions and the functions that fire them, and names bodies a later migration dropped or redefined instead of printing them.
 - A SQL table's trigger list now says it is complete as of the last migration, so you don't have to check later migrations for more.
+- TypeScript and JavaScript code that queries Postgres through Supabase (`.from`, `.rpc`), Knex, Kysely, or a Drizzle `pgTable` now links to the tables and functions it names in your migrations, so `codegraph_explore` follows an API handler into SQL and on to the triggers its writes fire.
 
 ### Fixes
 
