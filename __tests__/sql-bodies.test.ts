@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import { CodeGraph } from '../src';
 import { loadGrammarsForLanguages } from '../src/extraction/grammars';
 import { extractFromSource } from '../src/extraction/tree-sitter';
+import { splitOpReferenceName } from '../src/extraction/languages/postgres-bodies';
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'postgres');
 
@@ -12,9 +13,10 @@ const FIXTURE = path.join(__dirname, 'fixtures', 'postgres');
 function refs(source: string, file = 'm.sql'): string[] {
   const result = extractFromSource(file, source, 'postgres');
   const byId = new Map(result.nodes.map((n) => [n.id, n.qualifiedName]));
-  return result.unresolvedReferences.map((r) =>
-    `${byId.get(r.fromNodeId)} ${r.referenceKind} ${r.referenceName} ${r.line}:${r.column}${r.candidates ? ` ${r.candidates.join(',')}` : ''}`
-  );
+  return result.unresolvedReferences.map((r) => {
+    const { op, qualifiedName } = splitOpReferenceName(r.referenceName);
+    return `${byId.get(r.fromNodeId)} ${r.referenceKind} ${qualifiedName} ${r.line}:${r.column}${op ? ` ${op}` : ''}`;
+  });
 }
 
 describe('PostgreSQL routine bodies', () => {
@@ -41,9 +43,9 @@ describe('PostgreSQL routine bodies', () => {
     ].join('\n');
     expect(refs(source)).toEqual([
       'app::place_order calls public::count 7:9',
-      'app::place_order references app::carts 7:30 sql-op:select',
-      'app::place_order references public::orders 8:14 sql-op:insert',
-      'app::place_order references public::customers 9:9 sql-op:update',
+      'app::place_order references app::carts 7:30 select',
+      'app::place_order references public::orders 8:14 insert',
+      'app::place_order references public::customers 9:9 update',
       'app::place_order calls public::now 9:36',
       'app::place_order calls public::notify_order 10:10',
       'app::place_order calls public::customer_total 11:13',
@@ -67,11 +69,11 @@ describe('PostgreSQL routine bodies', () => {
       'END $$;',
     ].join('\n');
     expect(refs(source)).toEqual([
-      'public::audit references public::ledger 6:40 sql-op:select',
-      'public::audit references public::items 7:25 sql-op:select',
-      'public::audit references public::items 8:16 sql-op:delete',
-      'public::audit references public::events 10:32 sql-op:select',
-      'public::audit references public::archive 10:52 sql-op:insert',
+      'public::audit references public::ledger 6:40 select',
+      'public::audit references public::items 7:25 select',
+      'public::audit references public::items 8:16 delete',
+      'public::audit references public::events 10:32 select',
+      'public::audit references public::archive 10:52 insert',
       'public::audit calls public::now 11:20',
     ]);
   });
@@ -100,9 +102,9 @@ describe('PostgreSQL routine bodies', () => {
     ].join('\n');
     expect(refs(source)).toEqual([
       'public::open_count calls public::count 2:9',
-      'public::open_count references public::orders 2:23 sql-op:select',
-      'public::restock references public::stock 5:13 sql-op:merge',
-      'public::restock references public::deliveries 5:27 sql-op:select',
+      'public::open_count references public::orders 2:23 select',
+      'public::restock references public::stock 5:13 merge',
+      'public::restock references public::deliveries 5:27 select',
     ]);
   });
 
@@ -117,8 +119,8 @@ describe('PostgreSQL routine bodies', () => {
       '$do$;',
     ].join('\n');
     expect(refs(source, 'seed.sql')).toEqual([
-      'seed.sql references app::settings 3:31 sql-op:select',
-      'seed.sql references app::settings 4:16 sql-op:insert',
+      'seed.sql references app::settings 3:31 select',
+      'seed.sql references app::settings 4:16 insert',
     ]);
   });
 
@@ -130,14 +132,14 @@ describe('PostgreSQL routine bodies', () => {
       'END',
       '$fn$;',
     ].join('\n');
-    expect(refs(source)).toEqual(['public::tagged references public::labels 3:38 sql-op:select']);
+    expect(refs(source)).toEqual(['public::tagged references public::labels 3:38 select']);
   });
 
   it('places every reference at the line and column where its name is written', () => {
     const source = fs.readFileSync(path.join(FIXTURE, 'migrations', '002_functions.sql'), 'utf8');
     const lines = source.split(/\r?\n/);
     const result = extractFromSource('migrations/002_functions.sql', source, 'postgres');
-    const fromBodies = result.unresolvedReferences.filter((r) => r.candidates || r.referenceKind === 'calls');
+    const fromBodies = result.unresolvedReferences.filter((r) => splitOpReferenceName(r.referenceName).op || r.referenceKind === 'calls');
     const written = fromBodies.map((r) => {
       const name = r.referenceName.split('::').pop()!;
       return `${name} ${lines[r.line - 1]!.slice(r.column, r.column + name.length)}`;

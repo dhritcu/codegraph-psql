@@ -17,7 +17,9 @@
  * An object owned by a table (trigger, index, policy, a constraint or column
  * added by ALTER TABLE) nests under the table when this file declares it,
  * and otherwise stands alone at the top level under the qualified name
- * `schema::table::name`, with a `references` edge to the table.
+ * `schema::table::name`, with a `references` edge to the table. An unnamed
+ * foreign key added that way takes the name Postgres gives it,
+ * `<table>_<columns>_fkey`, so it stands alone like a named one.
  *
  * A function's signature records its language. What a PL/pgSQL or SQL body
  * (or a DO block) reads, writes, and calls is read by `postgres-bodies.ts`.
@@ -26,7 +28,7 @@
 import type { Node as SyntaxNode, Point } from 'web-tree-sitter';
 import type { EdgeKind, Node, NodeKind } from '../../types';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
-import { doBlockRefs, routineBodyRefs, SQL_OP_CANDIDATE, type SqlOp } from './postgres-bodies';
+import { doBlockRefs, opReferenceName, routineBodyRefs, type SqlOp } from './postgres-bodies';
 import { foldObjectName, objectFromParts, qualify, splitIdentifierPath, type SqlName } from './postgres-names';
 import { preParsePostgres } from './postgres-preparse';
 
@@ -78,6 +80,8 @@ interface SqlDecl {
   objectType: SqlObjectType;
   name: SqlName | null;
   owner?: SqlName;
+  /** A constraint named by Postgres, not the statement: in its table's own file its references stay the table's. */
+  implicitName?: boolean;
   at: SyntaxNode;
   signature: string;
   members: SqlMember[];
@@ -314,13 +318,18 @@ const READERS: Record<string, Reader> = {
     const owner = relationName(child(stmt, 'relation_expr'));
     if (!owner || !hasKeyword(stmt, 'kw_table')) return [];
     const out: SqlDecl[] = [];
-    const columnRefs: SqlRef[] = [];
     const columns: SqlMember[] = [];
+    const constraint = (at: SyntaxNode, name: string, refs: SqlRef[], implicitName = false): SqlDecl =>
+      decl('constraint', at, { schema: owner.schema, name }, {
+        owner, refs, implicitName, signature: `constraint: ${oneLine(at.text).slice(0, 200)}`,
+      });
     for (const cmd of flatten(child(stmt, 'alter_table_cmds'), 'alter_table_cmd')) {
       const def = child(cmd, 'columnDef');
       if (def && hasKeyword(cmd, 'kw_add')) {
-        const col = readColumn(def, columnRefs);
+        const fkRefs: SqlRef[] = [];
+        const col = readColumn(def, fkRefs);
         if (col) columns.push(col);
+        if (col && fkRefs.length > 0) out.push(constraint(def, `${owner.name}_${col.name}_fkey`, fkRefs, true));
       }
       const tc = child(cmd, 'TableConstraint');
       const elem = tc && child(tc, 'ConstraintElem');
@@ -328,17 +337,11 @@ const READERS: Record<string, Reader> = {
       if (!tc || refs.length === 0) continue;
       const id = child(tc, 'name');
       const name = id && splitIdentifierPath(id.text)[0];
-      if (name) {
-        out.push(decl('constraint', tc, { schema: owner.schema, name }, {
-          owner, refs, signature: `constraint: ${oneLine(tc.text).slice(0, 200)}`,
-        }));
-      } else {
-        columnRefs.push(...refs);
-      }
+      const keyColumns = flatten(child(elem!, 'columnList'), 'columnElem').map((c) => splitIdentifierPath(c.text)[0]);
+      if (name) out.push(constraint(tc, name, refs));
+      else if (keyColumns.length > 0) out.push(constraint(tc, `${owner.name}_${keyColumns.join('_')}_fkey`, refs, true));
     }
-    if (columns.length > 0 || columnRefs.length > 0) {
-      out.unshift(decl('column', stmt, null, { owner, members: columns, refs: columnRefs }));
-    }
+    if (columns.length > 0) out.unshift(decl('column', stmt, null, { owner, members: columns }));
     return out;
   },
 };
@@ -391,18 +394,21 @@ function addRefs(ctx: ExtractorContext, fromNodeId: string, refs: SqlRef[]): voi
   for (const ref of refs) {
     ctx.addUnresolvedReference({
       fromNodeId,
-      referenceName: qualify(ref.target),
+      referenceName: ref.op ? opReferenceName(ref.op, qualify(ref.target)) : qualify(ref.target),
       referenceKind: ref.kind,
       line: ref.at.startPosition.row + 1,
       column: ref.at.startPosition.column,
-      ...(ref.op ? { candidates: [SQL_OP_CANDIDATE + ref.op] } : {}),
     });
   }
 }
 
 function emit(d: SqlDecl, ctx: ExtractorContext): void {
   const ownerNode = d.owner ? findTable(ctx, d.owner) : undefined;
-  const ownerRef: SqlRef[] = d.owner && !ownerNode ? [{ target: d.owner, kind: 'references', at: d.at }] : [];
+  if (d.implicitName && ownerNode) {
+    addRefs(ctx, ownerNode.id, d.refs);
+    return;
+  }
+  const toOwner = (at: SyntaxNode): SqlRef[] => (d.owner && !ownerNode ? [{ target: d.owner, kind: 'references', at }] : []);
   if (ownerNode) ctx.pushScope(ownerNode.id);
   try {
     let parent: Node | null | undefined = ownerNode;
@@ -417,13 +423,10 @@ function emit(d: SqlDecl, ctx: ExtractorContext): void {
         isExported: true,
       });
       if (!parent) return;
-      addRefs(ctx, parent.id, [...d.refs, ...ownerRef]);
+      addRefs(ctx, parent.id, [...d.refs, ...toOwner(d.at)]);
       memberBase = d.name;
     } else if (ownerNode) {
       addRefs(ctx, ownerNode.id, d.refs);
-    } else {
-      const fileId = ctx.nodeStack[0];
-      if (fileId) addRefs(ctx, fileId, d.refs);
     }
     if (!memberBase || d.members.length === 0) return;
     if (parent) ctx.pushScope(parent.id);
@@ -434,7 +437,7 @@ function emit(d: SqlDecl, ctx: ExtractorContext): void {
           signature: m.signature,
           isExported: true,
         });
-        if (member) addRefs(ctx, member.id, m.refs);
+        if (member) addRefs(ctx, member.id, d.name ? m.refs : [...m.refs, ...toOwner(m.at)]);
       }
     } finally {
       if (parent) ctx.popScope();

@@ -132,9 +132,15 @@ describe('PostgreSQL schema extraction', () => {
       'postgres'
     );
     const byId = new Map(result.nodes.map((n) => [n.id, n.qualifiedName]));
-    expect(result.nodes.map((n) => `${n.kind} ${n.qualifiedName}`)).toEqual(['file m2.sql', 'field public::Booking::location']);
+    expect(result.nodes.map((n) => `${n.kind} ${n.qualifiedName}`)).toEqual([
+      'file m2.sql',
+      'field public::Booking::location',
+      'property public::Booking::Booking_userId_fkey',
+    ]);
     expect(result.unresolvedReferences.map((r) => `${byId.get(r.fromNodeId)} ${r.referenceKind} ${r.referenceName}`)).toEqual([
-      'm2.sql references public::users',
+      'public::Booking::location references public::Booking',
+      'public::Booking::Booking_userId_fkey references public::users',
+      'public::Booking::Booking_userId_fkey references public::Booking',
     ]);
   });
 
