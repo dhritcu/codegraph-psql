@@ -219,6 +219,12 @@ describe('psql preparse', () => {
     const plain = 'SELECT a::int FROM t;\n';
     expect(preParsePostgres(plain)).toBe(plain);
   });
+
+  it('keeps an array slice with named bounds, which is no psql variable', () => {
+    const source = 'CREATE VIEW recent_tags AS SELECT tags[lo:hi], tags[:hi], tags[lo:] FROM posts;\n';
+    expect(preParsePostgres(source)).toBe(source);
+    expect(symbols('v.sql', source)).toEqual(['class public::recent_tags :1']);
+  });
 });
 
 describe('indexing the shop schema', () => {
