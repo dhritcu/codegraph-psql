@@ -70,9 +70,9 @@ export function isCrossFileSqlMember(member: Node, container: Node): boolean {
  * The columns, constraints and triggers later migrations declare on a table,
  * in apply order. Each references the table it nests under.
  */
-export function crossFileSqlMembers(cg: CodeGraph, container: Node): Node[] {
+export function crossFileSqlMembers(cg: CodeGraph, container: Node, incoming?: readonly Edge[]): Node[] {
   if (!isSqlNode(container)) return [];
-  const ids = cg.getIncomingEdges(container.id).filter((e) => e.kind === 'references').map((e) => e.source);
+  const ids = (incoming ?? cg.getIncomingEdges(container.id)).filter((e) => e.kind === 'references').map((e) => e.source);
   return [...cg.getNodesByIds([...new Set(ids)]).values()]
     .filter((member) => isCrossFileSqlMember(member, container))
     .sort(applyOrder);
@@ -136,15 +136,16 @@ function splitTopLevel(text: string): string[] {
 
 /** One argument's type as Postgres identifies it, or null for an OUT argument, which is no part of the signature. */
 function argType(arg: string): string | null {
-  const words = arg.replace(/\s+default\s[\s\S]*$/i, '').replace(/\s*=[\s\S]*$/, '').trim().split(/\s+/);
+  // A typmod (`numeric(10, 2)`, `timestamp(3) with time zone`) names no other type.
+  const words = arg.replace(/\s+default\s[\s\S]*$/i, '').replace(/\s*=[\s\S]*$/, '')
+    .replace(/\s*\([^)]*\)/g, '').trim().split(/\s+/);
   const mode = words[0]!.toLowerCase();
   if (ARG_MODES.has(mode) && words.length > 1) {
     if (mode === 'out') return null;
     words.shift();
   }
-  if (words.length > 1 && !TYPE_START_WORDS.has(words[0]!.toLowerCase()) && !/^[([]/.test(words[1]!)) words.shift();
+  if (words.length > 1 && !TYPE_START_WORDS.has(words[0]!.toLowerCase()) && !/^\[/.test(words[1]!)) words.shift();
   const type = words.join(' ').toLowerCase().replace(/"/g, '')
-    .replace(/\s*\([^)]*\)/g, '')
     .replace(/\s*\[\s*\d*\s*\]/g, '[]')
     .replace(/^pg_catalog\./, '');
   const arrays = /(\[\])*$/.exec(type)![0];
@@ -167,16 +168,24 @@ function parenthesized(text: string, open: number): string {
   return text.slice(open + 1);
 }
 
+const signatureMemo = new Map<string, string | null>();
+const SIGNATURE_MEMO_LIMIT = 50_000;
+
 /** A function's or procedure's argument types, `(int8,text)`: with its name, what Postgres knows it by. */
 export function routineSignature(node: Node): string | null {
-  const head = /^(?:function|procedure): .*?\b(?:function|procedure)\b/i.exec(node.signature ?? '');
-  if (!head || !isSqlNode(node)) return null;
-  const open = node.signature!.indexOf('(', head[0].length);
-  return open < 0 ? null : argSignature(parenthesized(node.signature!, open));
+  if (!isSqlNode(node) || !node.signature) return null;
+  const known = signatureMemo.get(node.signature);
+  if (known !== undefined) return known;
+  const head = /^(?:function|procedure): .*?\b(?:function|procedure)\b/i.exec(node.signature);
+  const open = head ? node.signature.indexOf('(', head[0].length) : -1;
+  const signature = open < 0 ? null : argSignature(parenthesized(node.signature, open));
+  if (signatureMemo.size >= SIGNATURE_MEMO_LIMIT) signatureMemo.clear();
+  signatureMemo.set(node.signature, signature);
+  return signature;
 }
 
 /** What a DROP ends: `routine:public::f(int4)` (or `routine:public::f`, any signature), `trigger:public::t::name`, `relation:public::t`. */
-interface SqlDrop {
+export interface SqlDrop {
   what: string;
   file: string;
   line: number;
@@ -265,15 +274,19 @@ function dropsIn(file: string, text: string): SqlDrop[] {
 
 const dropCache = new WeakMap<CodeGraph, { stamp: string; drops: Map<string, SqlDrop[]> }>();
 
-/** Every DROP the indexed SQL files run, by what it ends; read once per index state. */
+/**
+ * Every DROP the indexed SQL files run, by what it ends; read once per index
+ * revision. The revision is one aggregate query, where listing the files to
+ * stamp them cost more than the rest of an explore call.
+ */
 function sqlDrops(cg: CodeGraph): Map<string, SqlDrop[]> {
-  const files = cg.getFiles().filter((f) => SQL_FILE.test(f.path));
-  const stamp = files.map((f) => `${f.path}\0${f.contentHash}`).join('\n');
+  const { lastIndexedAt, fileCount } = cg.getIndexRevision();
+  const stamp = `${lastIndexedAt}:${fileCount}`;
   const cached = dropCache.get(cg);
   if (cached?.stamp === stamp) return cached.drops;
   const drops = new Map<string, SqlDrop[]>();
   const root = cg.getProjectRoot();
-  for (const f of files) {
+  for (const f of cg.getFiles().filter((file) => SQL_FILE.test(file.path))) {
     let text: string;
     try {
       text = fs.readFileSync(path.join(root, f.path), 'utf-8');
@@ -287,10 +300,10 @@ function sqlDrops(cg: CodeGraph): Map<string, SqlDrop[]> {
 }
 
 /** The first DROP of any of `whats` that runs after `node` in its migration series. */
-function droppedAfter(cg: CodeGraph, node: Node, whats: readonly string[]): SqlDrop | null {
+function droppedAfter(drops: Map<string, SqlDrop[]>, node: Node, whats: readonly string[]): SqlDrop | null {
   const series = migrationSeries(node.filePath);
   const later = whats
-    .flatMap((what) => sqlDrops(cg).get(what) ?? [])
+    .flatMap((what) => drops.get(what) ?? [])
     .filter((d) => migrationSeries(d.file) === series &&
       (d.file === node.filePath ? d.line > node.startLine : naturalOrder(d.file, node.filePath) > 0))
     .sort((a, b) => (a.file === b.file ? a.line - b.line : naturalOrder(a.file, b.file)));
@@ -308,12 +321,16 @@ function droppedAfter(cg: CodeGraph, node: Node, whats: readonly string[]): SqlD
 export function liveSqlDefinitions(
   cg: CodeGraph,
   nodes: readonly Node[],
+  drops?: Map<string, SqlDrop[]>,
 ): { nodes: Node[]; superseded: Map<string, Node[]> } {
-  const keyOf = (node: Node) =>
-    `${node.kind}|${node.qualifiedName}${routineSignature(node) ?? ''}|${migrationSeries(node.filePath)}`;
+  const keys = new Map<Node, string>();
+  const keyOf = (node: Node) => keys.get(node)!;
   const copies = new Map<string, Node[]>();
   for (const node of nodes) {
-    if (isSqlNode(node)) copies.set(keyOf(node), [...(copies.get(keyOf(node)) ?? []), node]);
+    if (!isSqlNode(node)) continue;
+    const key = `${node.kind}|${node.qualifiedName}${routineSignature(node) ?? ''}|${migrationSeries(node.filePath)}`;
+    keys.set(node, key);
+    copies.set(key, [...(copies.get(key) ?? []), node]);
   }
   const lives = new Map<string, { live: Node; earlier: Node[] }>();
   for (const [key, all] of copies) {
@@ -332,11 +349,8 @@ export function liveSqlDefinitions(
   const dropped = new Map<string, string>();
   for (const keys of overloads.values()) {
     if (keys.length < 2) continue;
-    const ended = keys.filter((key) => {
-      const { live } = lives.get(key)!;
-      const what = `routine:${live.qualifiedName}`;
-      return droppedAfter(cg, live, [what, `${what}${routineSignature(live)}`]) !== null;
-    });
+    drops ??= sqlDrops(cg);
+    const ended = keys.filter((key) => droppedAfter(drops!, lives.get(key)!.live, routineDropKeys(lives.get(key)!.live)) !== null);
     const standing = keys.filter((key) => !ended.includes(key));
     if (ended.length === 0 || standing.length === 0) continue;
     const heir = standing.reduce((a, b) => (applyOrder(lives.get(a)!.live, lives.get(b)!.live) >= 0 ? a : b));
@@ -400,24 +414,63 @@ function triggerWhen(trigger: Node): string {
 
 const isTrigger = (node: Node) => (node.signature ?? '').startsWith('trigger:');
 
+function triggerFunction(cg: CodeGraph, trigger: Node): Node | null {
+  const call = cg.getOutgoingEdges(trigger.id).find((e) => e.kind === 'calls');
+  return call ? cg.getNode(call.target) : null;
+}
+
+function routineDropKeys(fn: Node): string[] {
+  const sig = routineSignature(fn);
+  return [`routine:${fn.qualifiedName}`, ...(sig ? [`routine:${fn.qualifiedName}${sig}`] : [])];
+}
+
+/** A trigger ends with its own DROP, its table's, or its function's. */
+function triggerDropKeys(trigger: Node, tableName: string, fn: Node | null): string[] {
+  return [`trigger:${trigger.qualifiedName}`, `relation:${tableName}`, ...(fn ? routineDropKeys(fn) : [])];
+}
+
+/**
+ * The DROP that ends a SQL routine, trigger, table or view after this
+ * definition of it, or null while it stands. Meant for a live definition (one
+ * `liveSqlDefinitions` keeps): an earlier copy may be dropped and created anew.
+ */
+export function sqlDroppedAt(cg: CodeGraph, node: Node): SqlDrop | null {
+  return isSqlNode(node) ? droppedWith(cg, sqlDrops(cg), node) : null;
+}
+
+function droppedWith(cg: CodeGraph, drops: Map<string, SqlDrop[]>, node: Node): SqlDrop | null {
+  let whats: string[];
+  if (isTrigger(node)) whats = triggerDropKeys(node, node.qualifiedName.slice(0, node.qualifiedName.lastIndexOf('::')), triggerFunction(cg, node));
+  else if (routineSignature(node) !== null) whats = routineDropKeys(node);
+  else if (node.kind === 'class') whats = [`relation:${node.qualifiedName}`];
+  else return null;
+  return droppedAfter(drops, node, whats);
+}
+
+/** `migrations/0052.sql:26`: where a DROP runs. */
+export const dropSite = (drop: SqlDrop) => `${drop.file}:${drop.line}`;
+
 /** A table's triggers by name: the latest definition of each, live or ended by a later DROP. */
-function tableTriggers(cg: CodeGraph, table: Node): { live: SqlTrigger[]; dropped: Array<{ node: Node; drop: SqlDrop }> } {
+function tableTriggers(
+  cg: CodeGraph,
+  table: Node,
+  members: readonly Node[],
+  drops: Map<string, SqlDrop[]>,
+): { live: SqlTrigger[]; dropped: Array<{ node: Node; drop: SqlDrop }> } {
   const latest = new Map<string, Node>();
-  for (const node of [...cg.getChildren(table.id), ...crossFileSqlMembers(cg, table)].filter(isTrigger).sort(applyOrder)) {
+  for (const node of members.filter(isTrigger).sort(applyOrder)) {
     latest.set(node.qualifiedName, node);
   }
+  const calls = new Map<string, string>();
+  for (const e of cg.getOutgoingEdgesFrom([...latest.values()].map((n) => n.id), ['calls'])) {
+    if (!calls.has(e.source)) calls.set(e.source, e.target);
+  }
+  const fns = cg.getNodesByIds([...new Set(calls.values())]);
   const live: SqlTrigger[] = [];
   const dropped: Array<{ node: Node; drop: SqlDrop }> = [];
   for (const node of [...latest.values()].sort((a, b) => a.name.localeCompare(b.name))) {
-    const call = cg.getOutgoingEdges(node.id).find((e) => e.kind === 'calls');
-    const fn = call ? cg.getNode(call.target) : null;
-    const whats = [`trigger:${node.qualifiedName}`, `relation:${table.qualifiedName}`];
-    if (fn) {
-      whats.push(`routine:${fn.qualifiedName}`);
-      const sig = routineSignature(fn);
-      if (sig) whats.push(`routine:${fn.qualifiedName}${sig}`);
-    }
-    const drop = droppedAfter(cg, node, whats);
+    const fn = fns.get(calls.get(node.id) ?? '') ?? null;
+    const drop = droppedAfter(drops, node, triggerDropKeys(node, table.qualifiedName, fn));
     if (drop) dropped.push({ node, drop });
     else live.push({ node, when: triggerWhen(node), fn });
   }
@@ -453,9 +506,11 @@ export function writePathTables(cg: CodeGraph, node: Node): Node[] {
  */
 export function sqlTableSummary(cg: CodeGraph, table: Node): string | null {
   if (table.kind !== 'class' || !isSqlNode(table)) return null;
-  const members = [...cg.getChildren(table.id), ...crossFileSqlMembers(cg, table)];
+  const incoming = cg.getIncomingEdges(table.id);
+  const members = [...cg.getChildren(table.id), ...crossFileSqlMembers(cg, table, incoming)];
   const columns = new Set(members.filter((m) => m.kind === 'field').map((m) => m.name)).size;
-  const { live, dropped } = tableTriggers(cg, table);
+  const drops = sqlDrops(cg);
+  const { live, dropped } = tableTriggers(cg, table, members, drops);
   const lines = [`**SQL table \`${table.qualifiedName}\`** (${at(table)}): ${columns} column${columns === 1 ? '' : 's'}`];
 
   if (live.length > 0) lines.push(`- Triggers (${live.length}):`);
@@ -466,21 +521,28 @@ export function sqlTableSummary(cg: CodeGraph, table: Node): string | null {
 
   const liveNames = new Set(live.map((t) => t.node.qualifiedName));
   const byOp = new Map<string, Map<string, Edge[]>>();
-  for (const edge of cg.getIncomingEdges(table.id)) {
+  for (const edge of incoming) {
     const op = sqlEdgeOp(edge);
     if (!op || op === 'select') continue;
     const writers = byOp.get(op) ?? new Map<string, Edge[]>();
     writers.set(edge.source, [...(writers.get(edge.source) ?? []), edge]);
     byOp.set(op, writers);
   }
+  const writerIds = [...new Set([...byOp.values()].flatMap((writers) => [...writers.keys()]))];
+  const writerNodes = cg.getNodesByIds(writerIds);
+  const firedBy = new Map<string, string[]>();
+  for (const e of cg.getOutgoingEdgesFrom(writerIds, ['calls'])) {
+    const m = e.metadata as { synthesizedBy?: unknown; trigger?: unknown } | undefined;
+    if (m?.synthesizedBy !== 'pg-trigger' || !liveNames.has(String(m.trigger))) continue;
+    firedBy.set(e.source, [...(firedBy.get(e.source) ?? []), String(m.trigger).split('::').pop()!]);
+  }
   for (const op of [...SQL_OPS].filter((o) => byOp.has(o))) {
     const writers = byOp.get(op)!;
-    const nodes = liveSqlDefinitions(cg, [...cg.getNodesByIds([...writers.keys()]).values()]).nodes;
+    const nodes = liveSqlDefinitions(cg, [...writers.keys()].map((id) => writerNodes.get(id)).filter((n): n is Node => !!n), drops).nodes;
     const entries = nodes.map((writer) => {
-      const fires = [...new Set(cg.getOutgoingEdges(writer.id)
-        .map((e) => (e.metadata as { synthesizedBy?: unknown; trigger?: unknown } | undefined))
-        .filter((m) => m?.synthesizedBy === 'pg-trigger' && liveNames.has(String(m.trigger)))
-        .map((m) => String(m!.trigger).split('::').pop()!))];
+      const drop = droppedWith(cg, drops, writer);
+      if (drop) return `${writer.name} (${at(writer)}, dropped ${dropSite(drop)})`;
+      const fires = [...new Set(firedBy.get(writer.id) ?? [])];
       return `${writer.name} (${at(writer)})${fires.length > 0 ? ` fires ${fires.join(', ')}` : ''}`;
     });
     lines.push(`- ${op}: ${listed(entries)}`);
@@ -495,4 +557,37 @@ export function sqlTableSummary(cg: CodeGraph, table: Node): string | null {
     lines.push(`- Dropped triggers: ${listed(dropped.map((d) => `${d.node.name} (declared ${at(d.node)}, dropped ${d.drop.file}:${d.drop.line})`))}`);
   }
   return lines.join('\n');
+}
+
+const SQL_PATH_TOKEN = /^"?[A-Za-z_][\w$]*"?(?:\.|::)"?[A-Za-z_][\w$]*"?$/;
+
+/**
+ * The SQL objects a query names as Postgres writes them, `storage.objects` or
+ * `"storage"."objects"`, which the index keeps as `storage::objects`.
+ */
+export function sqlObjectsNamed(cg: CodeGraph, query: string): Node[] {
+  const out = new Map<string, Node>();
+  for (const token of query.split(/[\s,()[\]]+/)) {
+    const written = token.replace(/[.,;:?!]+$/, '');
+    if (!SQL_PATH_TOKEN.test(written)) continue;
+    const name = foldObjectName(written.replace(/::/g, '.'));
+    if (!name) continue;
+    const qualified = qualify(name);
+    for (const n of cg.getNodesByName(name.name)) {
+      if (isSqlNode(n) && n.qualifiedName === qualified) out.set(n.id, n);
+    }
+  }
+  return [...out.values()];
+}
+
+/** `objects_cleanup (function, declared a.sql:1, dropped b.sql:2)` for each of `nodes` a later migration dropped. */
+export function droppedSqlObjects(cg: CodeGraph, nodes: readonly Node[]): string[] {
+  const live = liveSqlDefinitions(cg, nodes.filter(isSqlNode)).nodes;
+  if (live.length === 0) return [];
+  const drops = sqlDrops(cg);
+  return live.flatMap((n) => {
+    const drop = n.kind === 'class' ? null : droppedWith(cg, drops, n);
+    const kind = isTrigger(n) ? 'trigger' : n.kind;
+    return drop ? [`${n.name} (${kind}, declared ${at(n)}, dropped ${dropSite(drop)})`] : [];
+  });
 }

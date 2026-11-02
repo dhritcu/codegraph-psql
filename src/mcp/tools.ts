@@ -57,7 +57,7 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
-import { crossFileSqlMembers, isSqlNode, liveSqlDefinitions, sqlCallerRows, sqlEdgeOps, sqlOpTags, sqlTableSummary, writePathTables } from '../graph/sql-surface';
+import { crossFileSqlMembers, dropSite, droppedSqlObjects, isSqlNode, liveSqlDefinitions, sqlCallerRows, sqlDroppedAt, sqlEdgeOps, sqlObjectsNamed, sqlOpTags, sqlTableSummary, writePathTables } from '../graph/sql-surface';
 import { describeTableAccess } from '../graph/sql-flow';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
@@ -4251,10 +4251,13 @@ export class ToolHandler {
   private buildSqlTablesSection(cg: CodeGraph, subgraph: Subgraph, query: string): string {
     const MAX_TABLES = 3;
     const found = [...subgraph.nodes.values()];
-    if (!found.some(isSqlNode)) return '';
+    const named = sqlObjectsNamed(cg, query);
+    if (named.length === 0 && !found.some(isSqlNode)) return '';
     const words = new Set(query.toLowerCase().split(/[^a-z0-9_$]+/));
     const candidates = new Map<string, Node>();
     const add = (n: Node) => { if (n.kind === 'class' && isSqlNode(n)) candidates.set(n.id, n); };
+    named.forEach(add);
+    named.forEach((n) => writePathTables(cg, n).forEach(add));
     found.filter((n) => words.has(n.name.toLowerCase())).forEach(add);
     found.forEach((n) => writePathTables(cg, n).forEach(add));
     found.forEach(add);
@@ -4264,6 +4267,10 @@ export class ToolHandler {
       const block = sqlTableSummary(cg, table);
       if (block && block.includes('\n')) blocks.push(block);
     }
+    // A routine or trigger the query names that a later migration dropped reads
+    // as gone, never as code that still runs.
+    const dropped = droppedSqlObjects(cg, [...named, ...found.filter((n) => words.has(n.name.toLowerCase()))]);
+    if (dropped.length > 0) blocks.push(`**Dropped by later migrations:** ${dropped.join(', ')}`);
     return blocks.length > 0 ? `${blocks.join('\n\n')}\n` : '';
   }
 
@@ -8159,12 +8166,13 @@ export class ToolHandler {
     if (sqlLive.nodes.length === 1) {
       const live = sqlLive.nodes[0]!;
       const earlier = sqlLive.superseded.get(live.id) ?? [];
-      return this.textResult(this.truncateOutput([
-        await this.renderNodeSection(cg, live, includeCode),
+      // Kept past the cut a long body takes, so the history is never what goes.
+      return this.textResult([
+        this.truncateOutput(await this.renderNodeSection(cg, live, includeCode)),
         '',
         `**Superseded by the definition above (${earlier.length}, latest first)**`,
         ...earlier.map((n) => `- ${n.filePath}:${n.startLine}`),
-      ].join('\n')));
+      ].join('\n'));
     }
 
     // Multiple definitions share this name — overloads, or same-named methods on
@@ -8494,7 +8502,9 @@ export class ToolHandler {
       }
     }
     const table = sqlTableSummary(cg, node);
-    return this.formatNodeDetails(node, code, outline) + (table ? `\n\n${table}\n` : '') + this.formatTrail(cg, node);
+    const drop = sqlDroppedAt(cg, node);
+    const dropNote = drop ? `**Dropped:** ${dropSite(drop)}, by a later migration; it does not exist once every migration applies.` : undefined;
+    return this.formatNodeDetails(node, code, outline, dropNote) + (table ? `\n\n${table}\n` : '') + this.formatTrail(cg, node);
   }
 
   // Whole-file fallback caps for a drifted file (#1474): small enough to fit
@@ -9191,13 +9201,14 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
+  private formatNodeDetails(node: Node, code: string | null, outline?: string | null, dropNote?: string): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `**${node.name}** (${node.kind})`,
       '',
       `**Location:** ${node.filePath}${location}`,
     ];
+    if (dropNote) lines.push(dropNote);
 
     if (node.signature) {
       lines.push(`**Signature:** \`${node.signature}\``);

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -336,6 +336,120 @@ describe('a SQL table\'s write path', () => {
         '- insert: add_note (migrations/001_init.sql:3) fires notes_stamp',
         '- Dropped triggers: notes_old (declared migrations/001_init.sql:5, dropped migrations/002_drop.sql:2)',
       ].join('\n'));
+    } finally {
+      cg.destroy();
+    }
+  });
+});
+
+describe('SQL objects a later migration drops', () => {
+  const OBJECTS = 'CREATE SCHEMA storage;\nCREATE TABLE storage.objects (id uuid, name text);\n';
+  const CLEANUP =
+    'CREATE FUNCTION storage.objects_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN DELETE FROM storage.objects WHERE false; RETURN NULL; END $$;\n' +
+    'CREATE TRIGGER objects_cleanup AFTER DELETE ON storage.objects FOR EACH STATEMENT EXECUTE FUNCTION storage.objects_cleanup();\n';
+  const GUARD =
+    'CREATE FUNCTION storage.protect_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN OLD; END $$;\n' +
+    'CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH ROW EXECUTE FUNCTION storage.protect_delete();\n';
+  const DROPS =
+    'DROP TRIGGER IF EXISTS objects_cleanup ON storage.objects;\n' +
+    'DO $$ BEGIN DROP FUNCTION IF EXISTS storage.objects_cleanup(); END $$;\n';
+  const files = {
+    'migrations/001_objects.sql': OBJECTS,
+    'migrations/002_cleanup.sql': CLEANUP,
+    'migrations/003_guard.sql': GUARD,
+    'migrations/004_drop.sql': DROPS,
+  };
+  const BLOCK = [
+    '**SQL table `storage::objects`** (migrations/001_objects.sql:2): 2 columns',
+    '- Triggers (1):',
+    '  - protect_objects_delete BEFORE DELETE → protect_delete (migrations/003_guard.sql:1), declared migrations/003_guard.sql:2',
+    '- delete: objects_cleanup (migrations/002_cleanup.sql:1, dropped migrations/004_drop.sql:2)',
+    '- Dropped triggers: objects_cleanup (declared migrations/002_cleanup.sql:2, dropped migrations/004_drop.sql:1)',
+  ].join('\n');
+
+  it.each(['storage.objects delete trigger', '"storage"."objects" delete trigger'])(
+    'answers %s with the table block in one explore call',
+    async (query) => {
+      const cg = await indexed(files);
+      try {
+        expect(await tool(cg, 'codegraph_explore', { query })).toContain(`${BLOCK}\n`);
+      } finally {
+        cg.destroy();
+      }
+    },
+  );
+
+  it('shows a dropped function as dropped in node and explore', async () => {
+    const cg = await indexed(files);
+    try {
+      const node = await tool(cg, 'codegraph_node', { symbol: 'storage::objects_cleanup' });
+      expect(node.startsWith([
+        '**objects_cleanup** (function)',
+        '',
+        '**Location:** migrations/002_cleanup.sql:1',
+        '**Dropped:** migrations/004_drop.sql:2, by a later migration; it does not exist once every migration applies.',
+      ].join('\n'))).toBe(true);
+      expect(await tool(cg, 'codegraph_explore', { query: 'objects_cleanup storage.objects' })).toContain(
+        '**Dropped by later migrations:** objects_cleanup (function, declared migrations/002_cleanup.sql:1, dropped migrations/004_drop.sql:2), ' +
+          'objects_cleanup (trigger, declared migrations/002_cleanup.sql:2, dropped migrations/004_drop.sql:1)',
+      );
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('reads the DROPs once per index revision, not once per object, and again after a sync', async () => {
+    const cg = await indexed(files);
+    try {
+      const getFiles = vi.spyOn(cg, 'getFiles');
+      for (const symbol of ['storage::objects', 'storage::objects', 'storage::objects_cleanup', 'objects_cleanup']) {
+        await tool(cg, 'codegraph_node', { symbol });
+      }
+      expect(getFiles).toHaveBeenCalledTimes(1);
+
+      write({ 'migrations/005_drop_guard.sql': 'DROP TRIGGER protect_objects_delete ON storage.objects;\n' });
+      await cg.sync();
+      const node = await tool(cg, 'codegraph_node', { symbol: 'storage::objects' });
+      expect(getFiles).toHaveBeenCalledTimes(2);
+      expect(node).toContain(
+        '- Dropped triggers: objects_cleanup (declared migrations/002_cleanup.sql:2, dropped migrations/004_drop.sql:1), ' +
+          'protect_objects_delete (declared migrations/003_guard.sql:2, dropped migrations/005_drop_guard.sql:1)',
+      );
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('keeps the superseded list when a long body is cut', async () => {
+    const body = Array.from({ length: 800 }, (_, i) => `  PERFORM ${i} + ${i};`).join('\n');
+    const cg = await indexed({
+      'migrations/001_t.sql': 'CREATE FUNCTION big() RETURNS void LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;\n',
+      'migrations/002_t.sql': `CREATE OR REPLACE FUNCTION big() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n${body}\nEND\n$$;\n`,
+    });
+    try {
+      const node = await tool(cg, 'codegraph_node', { symbol: 'big', includeCode: true });
+      expect(node).toContain('... (output truncated)');
+      expect(node.endsWith('**Superseded by the definition above (1, latest first)**\n- migrations/001_t.sql:1')).toBe(true);
+    } finally {
+      cg.destroy();
+    }
+  });
+});
+
+describe('SQL argument types with a typmod', () => {
+  it.each([
+    ['numeric(10, 2)', 'p numeric'],
+    ['timestamp(3) with time zone', 'at timestamptz'],
+    ['varchar(20)[]', 'names character varying[]'],
+  ])('takes %s and %s for one signature', async (first, second) => {
+    const cg = await indexed({
+      'migrations/001_t.sql': `CREATE FUNCTION fmt(${first}) RETURNS text LANGUAGE sql AS $$ SELECT 'a' $$;\n`,
+      'migrations/002_t.sql': `CREATE OR REPLACE FUNCTION fmt(${second}) RETURNS text LANGUAGE sql AS $$ SELECT 'b' $$;\n`,
+    });
+    try {
+      const node = await tool(cg, 'codegraph_node', { symbol: 'fmt' });
+      expect(node.startsWith('**fmt** (function)\n\n**Location:** migrations/002_t.sql:1')).toBe(true);
+      expect(node.endsWith('**Superseded by the definition above (1, latest first)**\n- migrations/001_t.sql:1')).toBe(true);
     } finally {
       cg.destroy();
     }
