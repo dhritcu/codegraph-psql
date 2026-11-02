@@ -76,6 +76,7 @@ function preParsePsql(source: string): string {
 
   const n = source.length;
   let stmtStart = 0;
+  let brackets = 0;
   let i = 0;
   while (i < n) {
     const ch = source[i]!;
@@ -118,9 +119,15 @@ function preParsePsql(source: string): string {
       const end = lineEnd(i);
       blank(i, end);
       i = end;
+    } else if (ch === '[' || ch === ']') {
+      brackets = Math.max(0, brackets + (ch === '[' ? 1 : -1));
+      i++;
     } else if (ch === ':') {
       if (next === ':') {
         i += 2;
+      } else if (brackets > 0) {
+        // Inside a subscript, `a[lo:hi]` is an array slice.
+        i++;
       } else {
         if (next !== undefined && /["'A-Za-z_]/.test(next)) blank(i, i + 1);
         i++;
@@ -141,6 +148,7 @@ function preParsePsql(source: string): string {
         i++;
       }
       stmtStart = i;
+      brackets = 0;
     } else {
       i++;
     }
