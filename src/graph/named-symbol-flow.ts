@@ -38,6 +38,7 @@ import { isTestFile, splitAtCjkSwitches, isQueryNameToken } from '../search/quer
 
 import { qualifiedSymbolMatches } from './symbol-lookup';
 import { goPackageReaderFor } from './go-package';
+import { sqlFlow, sqlTablesOf, type TableEnd } from './sql-flow';
 
 // Preserve the existing imports while sharing the matcher with the CLI and MCP.
 export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
@@ -213,6 +214,8 @@ export interface NamedSymbolFlow {
   named: Map<string, Node>;
   /** Non-callable endpoints of synthesized edges (RTK thunks and friends). */
   dynNamed: Map<string, Node>;
+  /** SQL tables the query named: never seeds, but a flow may end at one or pass through it. */
+  tables: Map<string, Node>;
   /** token → the node ids it resolved to. */
   tokenNodes: Map<string, string[]>;
   /** token → its whole same-name callable family, before the container filter. */
@@ -229,6 +232,7 @@ const EMPTY_FLOW = (): NamedSymbolFlow => ({
   tokens: [],
   named: new Map(),
   dynNamed: new Map(),
+  tables: new Map(),
   tokenNodes: new Map(),
   tokenFamily: new Map(),
   uniqueNamedNodeIds: new Set(),
@@ -334,10 +338,9 @@ export function resolveNamedTokens(
     const kept = directed
       ? rankForDirected(pick).slice(0, MAX_CANDIDATES_DIRECTED)
       : pick.slice(0, MAX_CANDIDATES_PER_TOKEN);
-    out.tokenNodes.set(
-      t,
-      kept.map((n) => n.id)
-    );
+    const tables = directed ? [] : sqlTablesOf(hits);
+    out.tokenNodes.set(t, [...kept, ...tables].map((n) => n.id));
+    for (const n of tables) out.tables.set(n.id, n);
     const precise = isPreciseToken(t);
     for (const n of kept) {
       out.named.set(n.id, n);
@@ -657,7 +660,8 @@ export function resolveNamedSymbolFlow(
   try {
     const directed = opts.mode === 'directed';
     const flow = resolveNamedTokens(cg, query, opts);
-    if (flow.named.size < 2) return flow;
+    if (flow.named.size === 0 || flow.named.size + flow.tables.size < 2) return flow;
+    const sql = sqlFlow(cg, flow.tables);
 
     const maxHops = opts.maxHops ?? (directed ? DIRECTED_MAX_HOPS : DEFAULT_MAX_HOPS);
     const maxBridge = opts.maxBridge ?? (directed ? Number.POSITIVE_INFINITY : DEFAULT_MAX_BRIDGE);
@@ -677,7 +681,7 @@ export function resolveNamedSymbolFlow(
         const seed = flow.named.get(id);
         if (!seed) continue;
         const steps = walkBidirectional(cg, seed, sinks, maxHops);
-        if (steps) found.push(steps);
+        if (steps) found.push(sql.expand(steps, null));
       }
     } else {
       const callees = new Map<string, ReturnType<CodeGraph['getCallees']>>();
@@ -693,15 +697,18 @@ export function resolveNamedSymbolFlow(
         const { parent, reached } = walkCalls(calleesOf, seed, namedIds, maxHops, maxBridge);
         // Explore's rule: the DEEPEST named sink this seed can reach. Of two as
         // deep, the one whose route passes more named symbols, as in the walk.
-        let deepest: string | null = null;
-        for (const key of reached) {
-          const at = parent.get(key)!;
-          const best = deepest === null ? null : parent.get(deepest)!;
-          if (!best || at.depth > best.depth || (at.depth === best.depth && at.named > best.named)) {
-            deepest = key;
+        // Depth is counted as the chain prints, tables included.
+        let best: { key: string; end: TableEnd | null; len: number; named: number } | null = null;
+        for (const candidate of [
+          ...reached.map((key) => ({ key, end: null })),
+          ...sql.tableEnds(parent).map((end) => ({ key: end.key, end })),
+        ]) {
+          const at = sql.score(parent, candidate.key, candidate.end);
+          if (!best || at.len > best.len || (at.len === best.len && at.named > best.named)) {
+            best = { ...candidate, ...at };
           }
         }
-        if (deepest !== null) found.push(chainTo(parent, deepest));
+        if (best !== null) found.push(sql.expand(chainTo(parent, best.key), best.end));
       }
     }
 

@@ -89,6 +89,13 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       // Go: a call through a struct field holding a function, `d.refreshf(ctx)`;
       // `via` is the field it was copied from, which the wiring site writes.
       return hop(`func field ${quoted(m.field, 'a func field')}${m.via ? ` (set from \`${String(m.via)}\`)` : ''}`);
+    case 'pg-trigger': {
+      const [table, trigger] = String(m.trigger ?? '').split('::').slice(-2);
+      const timing = `${String(m.timing ?? '')} ${String(m.event ?? '')}`.trim().toUpperCase();
+      const level = m.level === 'statement' ? ' FOR EACH STATEMENT' : '';
+      const when = typeof m.when === 'string' ? ` WHEN (${m.when.replace(/\s+/g, ' ').trim()})` : '';
+      return hop(`trigger ${quoted(trigger, 'a trigger')} ${timing}${table ? ` ON \`${table}\`` : ''}${level}${when}`);
+    }
     default:
       // redux-thunk, cpp-override, gin-middleware-chain, flutter-build, …
       return hop(by.replace(/-/g, ' '));

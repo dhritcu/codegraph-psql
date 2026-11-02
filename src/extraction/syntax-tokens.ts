@@ -275,6 +275,13 @@ function visit(node: SyntaxNode, ctx: WalkContext, inString: boolean): void {
     return;
   }
 
+  // The Postgres grammar makes every keyword a named `kw_select` node, which
+  // the identifier rule below would otherwise claim.
+  if (node.isNamed && type.startsWith('kw_')) {
+    emit(ctx, node.startIndex, node.endIndex, 'keyword');
+    return;
+  }
+
   // Record the definition's own name BEFORE descending — the name node is a
   // descendant, so the mark has to be in place by the time the walk reaches it.
   if (ctx.defTypes.has(type)) {
