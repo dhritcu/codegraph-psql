@@ -19,12 +19,14 @@
  * and otherwise stands alone at the top level under the qualified name
  * `schema::table::name`, with a `references` edge to the table.
  *
- * Function bodies are left unread here; the signature records the language.
+ * A function's signature records its language. What a PL/pgSQL or SQL body
+ * (or a DO block) reads, writes, and calls is read by `postgres-bodies.ts`.
  */
 
-import type { Node as SyntaxNode } from 'web-tree-sitter';
+import type { Node as SyntaxNode, Point } from 'web-tree-sitter';
 import type { EdgeKind, Node, NodeKind } from '../../types';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import { doBlockRefs, routineBodyRefs, SQL_OP_CANDIDATE, type SqlOp } from './postgres-bodies';
 import { foldObjectName, objectFromParts, qualify, splitIdentifierPath, type SqlName } from './postgres-names';
 import { preParsePostgres } from './postgres-preparse';
 
@@ -55,7 +57,8 @@ const KIND: Record<SqlObjectType, NodeKind> = {
 interface SqlRef {
   target: SqlName;
   kind: EdgeKind;
-  at: SyntaxNode;
+  op?: SqlOp;
+  at: { startPosition: Point };
 }
 
 interface SqlMember {
@@ -81,7 +84,7 @@ interface SqlDecl {
   refs: SqlRef[];
 }
 
-type Reader = (stmt: SyntaxNode) => SqlDecl[];
+type Reader = (stmt: SyntaxNode, source: string) => SqlDecl[];
 
 const child = (n: SyntaxNode, type: string): SyntaxNode | null =>
   n.namedChildren.find((c) => c?.type === type) ?? null;
@@ -229,13 +232,14 @@ const READERS: Record<string, Reader> = {
   CreateMatViewStmt: (stmt) =>
     readView('materialized view', stmt, child(child(stmt, 'create_mv_target') ?? stmt, 'qualified_name')),
 
-  CreateFunctionStmt: (stmt) => {
+  CreateFunctionStmt: (stmt, source) => {
     const name = nameOf(child(stmt, 'func_name'));
     if (!name) return [];
     const objectType = hasKeyword(stmt, 'kw_procedure') ? 'procedure' : 'function';
     const head = oneLine(stmt.text.slice(0, (child(stmt, 'opt_createfunc_opt_list')?.startIndex ?? stmt.endIndex) - stmt.startIndex));
     const language = readFunctionLanguage(stmt);
     return [decl(objectType, stmt, name, {
+      refs: routineBodyRefs(stmt, source, language),
       signature: `${objectType}: ${head}${language ? ` LANGUAGE ${language}` : ''}`,
     })];
   },
@@ -391,6 +395,7 @@ function addRefs(ctx: ExtractorContext, fromNodeId: string, refs: SqlRef[]): voi
       referenceKind: ref.kind,
       line: ref.at.startPosition.row + 1,
       column: ref.at.startPosition.column,
+      ...(ref.op ? { candidates: [SQL_OP_CANDIDATE + ref.op] } : {}),
     });
   }
 }
@@ -463,10 +468,15 @@ export const postgresExtractor: LanguageExtractor = {
       applyComment(node, ctx);
       return true;
     }
+    const fileId = ctx.nodeStack[0];
+    if (node.type === 'DoStmt' && !node.hasError && fileId) {
+      addRefs(ctx, fileId, doBlockRefs(node, ctx.source));
+      return true;
+    }
     // A statement the grammar could not parse is usually another dialect
     // (MySQL backticks, SQLite AUTOINCREMENT); reading it would mint garbage.
     const read = node.hasError ? undefined : READERS[node.type];
-    if (read) for (const d of read(node)) emit(d, ctx);
+    if (read) for (const d of read(node, ctx.source)) emit(d, ctx);
     return true;
   },
 };

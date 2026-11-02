@@ -240,12 +240,16 @@ describe('indexing the shop schema', () => {
         .sort();
       expect(rows).toEqual([
         'app::archived_orders extends public::orders',
+        'app::cancel_order references public::orders',
+        'app::create_order calls public::customer_total',
+        'app::create_order references public::orders',
         'app::customer_revenue references public::orders',
         'app::open_orders references public::customers',
         'app::open_orders references public::orders',
         'app::order_items references public::orders',
         'app::order_items::order_items_sku_fk references app::order_items',
         'app::order_items::order_items_sku_fk references app::products',
+        'public::customer_total references public::orders',
         'public::customers::email type_of public::email',
         'public::customers::shipping_address type_of app::address',
         'public::orders references public::customers',
