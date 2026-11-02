@@ -96,6 +96,9 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       const when = typeof m.when === 'string' ? ` WHEN (${m.when.replace(/\s+/g, ' ').trim()})` : '';
       return hop(`trigger ${quoted(trigger, 'a trigger')} ${timing}${table ? ` ON \`${table}\`` : ''}${level}${when}`);
     }
+    case 'sql-client':
+      // A database client's call onto the table or function it names: supabase `.from('orders').update`.
+      return hop(`${String(m.client ?? 'db client')} ${quoted(m.call, 'a query')}`);
     default:
       // redux-thunk, cpp-override, gin-middleware-chain, flutter-build, …
       return hop(by.replace(/-/g, ' '));
