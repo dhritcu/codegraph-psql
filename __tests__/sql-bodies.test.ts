@@ -116,6 +116,22 @@ describe('PostgreSQL routine bodies', () => {
     ]);
   });
 
+  it('reads INTO inside a string or comment as text, not as INTO targets', () => {
+    const source = [
+      'CREATE FUNCTION relay() RETURNS void LANGUAGE plpgsql AS $$',
+      'DECLARE v_id int;',
+      'BEGIN',
+      "  INSERT INTO outbox (msg) VALUES ('queued INTO') RETURNING id -- keep INTO cache",
+      '    INTO v_id;',
+      "  UPDATE inbox SET note = 'moved INTO archive' WHERE id = v_id RETURNING id INTO v_id;",
+      'END $$;',
+    ].join('\n');
+    expect(refs(source)).toEqual([
+      'public::relay references public::outbox 4:14 insert',
+      'public::relay references public::inbox 6:9 update',
+    ]);
+  });
+
   it('invents nothing for dynamic SQL', () => {
     const source = [
       'CREATE FUNCTION purge(tbl text) RETURNS void LANGUAGE plpgsql AS $$',
