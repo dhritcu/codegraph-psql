@@ -246,6 +246,7 @@ describe('indexing the shop schema', () => {
         .sort();
       expect(rows).toEqual([
         'app::archived_orders extends public::orders',
+        'app::cancel_order calls public::touch_updated_at',
         'app::cancel_order references public::orders',
         'app::create_order calls public::customer_total',
         'app::create_order references public::orders',
