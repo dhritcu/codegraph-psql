@@ -51,6 +51,8 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  postgres: 'tree-sitter-postgres.wasm',
+  plpgsql: 'tree-sitter-plpgsql.wasm',
 };
 
 /**
@@ -171,6 +173,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // PostgreSQL: vendored, patched gmr/tree-sitter-postgres (see
+  // docs/grammars/tree-sitter-postgres.md). PL/pgSQL function bodies parse
+  // with the companion plpgsql grammar, which has no extension of its own.
+  '.sql': 'postgres',
+  '.psql': 'postgres',
+  '.pgsql': 'postgres',
 };
 
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
@@ -396,7 +404,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'postgres', 'plpgsql',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -478,6 +486,9 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
+  }
+  if (languages.includes('postgres')) {
+    languages = [...languages, 'plpgsql'];
   }
   // A view's `@code` blocks are C#, its `<script>` blocks JavaScript or
   // TypeScript. A sync that re-reads only a view loads what the view needs.
@@ -958,6 +969,8 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    postgres: 'PostgreSQL',
+    plpgsql: 'PL/pgSQL',
     unknown: 'Unknown',
   };
   return names[language] || language;

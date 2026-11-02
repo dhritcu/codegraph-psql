@@ -143,7 +143,7 @@ const DYN_KINDS: ReadonlySet<string> = new Set(['constant', 'variable', 'field',
 
 /** Only a REAL file extension is stripped from a token — `Class.method` is kept. */
 const FILE_EXT =
-  /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
+  /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|sql)$/i;
 
 /** Chain length ceiling, in NODES. Explore's Flow section has always used 7. */
 export const DEFAULT_MAX_HOPS = 7;
