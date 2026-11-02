@@ -78,6 +78,60 @@ describe('PostgreSQL routine bodies', () => {
     ]);
   });
 
+  it('reads a table whose name a variable or parameter shares wherever a table is written', () => {
+    const source = [
+      'CREATE FUNCTION sync_orders(items int) RETURNS void LANGUAGE plpgsql AS $$',
+      'DECLARE',
+      '  orders int;',
+      'BEGIN',
+      '  SELECT count(*) INTO orders FROM orders;',
+      '  INSERT INTO orders (n) VALUES (orders);',
+      '  UPDATE items SET n = orders;',
+      '  DELETE FROM orders WHERE n = items;',
+      'END $$;',
+    ].join('\n');
+    expect(refs(source)).toEqual([
+      'public::sync_orders calls public::count 5:9',
+      'public::sync_orders references public::orders 5:35 select',
+      'public::sync_orders references public::orders 6:14 insert',
+      'public::sync_orders references public::items 7:9 update',
+      'public::sync_orders references public::orders 8:14 delete',
+    ]);
+  });
+
+  it("reads a single-quoted body, '' escapes and all, at the file's lines and columns", () => {
+    const source = [
+      "CREATE FUNCTION touch(p int) RETURNS void LANGUAGE plpgsql AS '",
+      'BEGIN',
+      "  UPDATE orders SET note = ''it''''s'' WHERE id = p;",
+      "  INSERT INTO audit (msg) VALUES (''touched'');",
+      "END';",
+      "CREATE FUNCTION paid_count() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM orders WHERE status = ''paid''';",
+    ].join('\n');
+    expect(refs(source)).toEqual([
+      'public::touch references public::orders 3:9 update',
+      'public::touch references public::audit 4:14 insert',
+      'public::paid_count calls public::count 6:68',
+      'public::paid_count references public::orders 6:82 select',
+    ]);
+  });
+
+  it('reads INTO inside a string or comment as text, not as INTO targets', () => {
+    const source = [
+      'CREATE FUNCTION relay() RETURNS void LANGUAGE plpgsql AS $$',
+      'DECLARE v_id int;',
+      'BEGIN',
+      "  INSERT INTO outbox (msg) VALUES ('queued INTO') RETURNING id -- keep INTO cache",
+      '    INTO v_id;',
+      "  UPDATE inbox SET note = 'moved INTO archive' WHERE id = v_id RETURNING id INTO v_id;",
+      'END $$;',
+    ].join('\n');
+    expect(refs(source)).toEqual([
+      'public::relay references public::outbox 4:14 insert',
+      'public::relay references public::inbox 6:9 update',
+    ]);
+  });
+
   it('invents nothing for dynamic SQL', () => {
     const source = [
       'CREATE FUNCTION purge(tbl text) RETURNS void LANGUAGE plpgsql AS $$',

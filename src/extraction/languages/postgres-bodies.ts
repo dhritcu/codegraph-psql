@@ -69,24 +69,11 @@ const firstDescendant = (n: SyntaxNode, type: string): SyntaxNode | null => {
   return null;
 };
 
-function collectText(n: SyntaxNode, type: string, out: Set<string>): Set<string> {
-  for (const c of n.namedChildren) {
-    if (!c) continue;
-    if (c.type === type) {
-      const name = splitIdentifierPath(c.text)[0];
-      if (name) out.add(name);
-    } else {
-      collectText(c, type, out);
-    }
-  }
-  return out;
-}
-
 /**
- * Parse `range` of `source` with `parser`, seeing `overlays` in place of the
+ * Parse `ranges` of `source` with `parser`, seeing `overlays` in place of the
  * text they cover. Overlays keep every newline they cover, so rows stay the file's.
  */
-function parseRange(parser: Parser, source: string, range: Range, overlays: Overlay[] = []): SyntaxNode | null {
+function parseRanges(parser: Parser, source: string, ranges: Range[], overlays: Overlay[] = []): SyntaxNode | null {
   const input = overlays.length === 0
     ? source
     : (index: number): string | undefined => {
@@ -97,11 +84,15 @@ function parseRange(parser: Parser, source: string, range: Range, overlays: Over
       }
       return source.slice(index);
     };
-  return parser.parse(input, null, { includedRanges: [range] })?.rootNode ?? null;
+  return parser.parse(input, null, { includedRanges: ranges })?.rootNode ?? null;
 }
 
-/** Table and function references in a Postgres syntax tree. `locals` are names that are variables, never tables. */
-export function sqlTreeRefs(root: SyntaxNode, locals: ReadonlySet<string>, out: BodyRef[] = []): BodyRef[] {
+/**
+ * Table and function references in a Postgres syntax tree. A name in a table
+ * position is a table even where a variable or parameter shares it: PL/pgSQL
+ * substitutes variables only where a value can stand.
+ */
+export function sqlTreeRefs(root: SyntaxNode, out: BodyRef[] = []): BodyRef[] {
   const ctes = new Set<string>();
   for (const cte of root.descendantsOfType('common_table_expr')) {
     const name = cte?.namedChildren.find((c) => c?.type === 'name');
@@ -111,7 +102,7 @@ export function sqlTreeRefs(root: SyntaxNode, locals: ReadonlySet<string>, out: 
   const table = (q: SyntaxNode | null, op: SqlOp): void => {
     if (!q) return;
     const parts = splitIdentifierPath(q.text);
-    if (parts.length === 1 && (ctes.has(parts[0]!) || locals.has(parts[0]!))) return;
+    if (parts.length === 1 && ctes.has(parts[0]!)) return;
     const target = foldObjectName(q.text);
     if (target) out.push({ target, kind: 'references', op, at: { startPosition: q.startPosition } });
   };
@@ -142,6 +133,8 @@ function blank(source: string, start: number, end: number): Overlay {
   return { start, end, text: source.slice(start, end).replace(/[^\n]/g, ' ') };
 }
 
+const STRING_OR_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'/g;
+
 /**
  * `INTO [STRICT] a, b` in a PL/pgSQL statement names variables; outside
  * `INSERT INTO` / `MERGE INTO` it is blanked.
@@ -149,7 +142,7 @@ function blank(source: string, start: number, end: number): Overlay {
 function intoTargets(source: string, start: number, end: number): Overlay[] {
   const out: Overlay[] = [];
   const re = /(\S+)(\s+)INTO\s+(?:STRICT\s+)?(?:"[^"]*"|[\w$.]+)(?:\s*,\s*(?:"[^"]*"|[\w$.]+))*/gi;
-  const text = source.slice(start, end);
+  const text = source.slice(start, end).replace(STRING_OR_COMMENT, (m) => m.replace(/[^\n]/g, ' '));
   for (let m = re.exec(text); m; m = re.exec(text)) {
     const prev = m[1]!.toLowerCase();
     if (prev === 'insert' || prev === 'merge') continue;
@@ -176,22 +169,34 @@ function selectPrefix(source: string, at: number, atPoint: Point): { overlay: Ov
 }
 
 /** Table and function references of one PL/pgSQL `sql_expression`. */
-function expressionRefs(expr: SyntaxNode, source: string, locals: ReadonlySet<string>, out: BodyRef[]): void {
+/** The parts of `ranges` within `[from, to)`, cut at the given points. */
+function clip(ranges: Range[], from: number, fromPoint: Point, to: number, toPoint: Point): Range[] {
+  return ranges
+    .filter((r) => r.endIndex > from && r.startIndex < to)
+    .map((r) => ({
+      startIndex: Math.max(r.startIndex, from),
+      startPosition: r.startIndex < from ? fromPoint : r.startPosition,
+      endIndex: Math.min(r.endIndex, to),
+      endPosition: r.endIndex > to ? toPoint : r.endPosition,
+    }));
+}
+
+function expressionRefs(expr: SyntaxNode, body: Range[], source: string, out: BodyRef[]): void {
   const pg = getParser('postgres');
   if (!pg) return;
   const isStatement = expr.parent?.type === 'stmt_execsql' || STATEMENT_START.test(expr.text);
   const overlays = intoTargets(source, expr.startIndex, expr.endIndex);
-  let range: Range = { startIndex: expr.startIndex, endIndex: expr.endIndex, startPosition: expr.startPosition, endPosition: expr.endPosition };
+  const ranges = clip(body, expr.startIndex, expr.startPosition, expr.endIndex, expr.endPosition);
   if (!isStatement) {
     const prefix = selectPrefix(source, expr.startIndex, expr.startPosition);
     if (!prefix) return;
     overlays.unshift(prefix.overlay);
-    range = { ...range, startIndex: prefix.overlay.start, startPosition: prefix.start };
+    ranges.unshift({ startIndex: prefix.overlay.start, startPosition: prefix.start, endIndex: expr.startIndex, endPosition: expr.startPosition });
   }
-  const root = parseRange(pg, source, range, overlays);
+  const root = parseRanges(pg, source, ranges, overlays);
   if (!root) return;
   try {
-    if (!root.hasError) sqlTreeRefs(root, locals, out);
+    if (!root.hasError) sqlTreeRefs(root, out);
   } finally {
     root.tree.delete();
   }
@@ -205,22 +210,18 @@ const isDynamic = (expr: SyntaxNode): boolean =>
 const isAssignTarget = (expr: SyntaxNode): boolean =>
   expr.parent?.type === 'stmt_assign' && expr.parent.namedChildren.find((c) => c?.type === 'sql_expression')?.startIndex === expr.startIndex;
 
-function plpgsqlRefs(source: string, range: Range, params: ReadonlySet<string>): BodyRef[] {
+function plpgsqlRefs(source: string, body: Range[]): BodyRef[] {
   const pl = getParser('plpgsql');
   if (!pl) return [];
-  const root = parseRange(pl, source, range);
+  const root = parseRanges(pl, source, body);
   if (!root) return [];
   try {
-    const locals = new Set(params);
-    locals.add('new').add('old');
-    collectText(root, 'decl_varname', locals);
-    collectText(root, 'for_variable', locals);
     const out: BodyRef[] = [];
     const visit = (n: SyntaxNode): void => {
       for (const c of n.namedChildren) {
         if (!c) continue;
         if (c.type !== 'sql_expression') visit(c);
-        else if (!isDynamic(c) && !isAssignTarget(c)) expressionRefs(c, source, locals, out);
+        else if (!isDynamic(c) && !isAssignTarget(c)) expressionRefs(c, body, source, out);
       }
     };
     visit(root);
@@ -230,43 +231,55 @@ function plpgsqlRefs(source: string, range: Range, params: ReadonlySet<string>):
   }
 }
 
-/** The inside of a `$tag$...$tag$` or plain `'...'` string constant. */
-function bodyRange(sconst: SyntaxNode | null): Range | null {
+/** The point `offset` characters into `text`, which starts at `start`. */
+function pointAfter(text: string, start: Point, offset: number): Point {
+  const before = text.slice(0, offset);
+  const newline = before.lastIndexOf('\n');
+  if (newline < 0) return { row: start.row, column: start.column + offset };
+  return { row: start.row + before.split('\n').length - 1, column: offset - newline - 1 };
+}
+
+/**
+ * The inside of a `$tag$...$tag$` or plain `'...'` string constant. A quoted
+ * body leaves out the second quote of each `''`, so the parser reads the
+ * body's own text where the file has it escaped.
+ */
+function bodyRanges(sconst: SyntaxNode | null): Range[] | null {
   const str = sconst?.namedChildren[0];
   if (!str) return null;
   const text = str.text;
-  let open = 0;
+  const span = (from: number, to: number): Range => ({
+    startIndex: str.startIndex + from,
+    endIndex: str.startIndex + to,
+    startPosition: pointAfter(text, str.startPosition, from),
+    endPosition: pointAfter(text, str.startPosition, to),
+  });
   if (str.type === 'dollar_quoted_string') {
     const tag = /^\$[^$]*\$/.exec(text)?.[0];
     if (!tag || !text.endsWith(tag) || text.length < tag.length * 2) return null;
-    open = tag.length;
-  } else if (str.type === 'string_literal' && text.startsWith("'") && !text.slice(1, -1).includes("'")) {
-    open = 1;
-  } else {
-    return null;
+    return [span(tag.length, text.length - tag.length)];
   }
-  const endRow = str.endPosition.row;
-  const lastLineStart = text.lastIndexOf('\n') + 1;
-  return {
-    startIndex: str.startIndex + open,
-    endIndex: str.endIndex - open,
-    startPosition: { row: str.startPosition.row, column: str.startPosition.column + open },
-    endPosition: {
-      row: endRow,
-      column: lastLineStart === 0 ? str.endPosition.column - open : text.length - open - lastLineStart,
-    },
-  };
+  if (str.type !== 'string_literal' || !text.startsWith("'") || text.length < 2) return null;
+  const ranges: Range[] = [];
+  let from = 1;
+  for (let k = 1; k < text.length - 1; k++) {
+    if (text[k] !== "'") continue;
+    ranges.push(span(from, k + 1));
+    from = ++k + 1;
+  }
+  ranges.push(span(from, text.length - 1));
+  return ranges.filter((r) => r.endIndex > r.startIndex);
 }
 
-function sqlRefs(source: string, range: Range, params: ReadonlySet<string>): BodyRef[] {
+function sqlRefs(source: string, body: Range[]): BodyRef[] {
   const pg = getParser('postgres');
   if (!pg) return [];
-  const root = parseRange(pg, source, range);
+  const root = parseRanges(pg, source, body);
   if (!root) return [];
   try {
     const out: BodyRef[] = [];
     for (const stmt of root.namedChildren) {
-      if (stmt && !stmt.hasError) sqlTreeRefs(stmt, params, out);
+      if (stmt && !stmt.hasError) sqlTreeRefs(stmt, out);
     }
     return out;
   } finally {
@@ -276,25 +289,24 @@ function sqlRefs(source: string, range: Range, params: ReadonlySet<string>): Bod
 
 /** References made by a CREATE FUNCTION / PROCEDURE body in `language`. */
 export function routineBodyRefs(stmt: SyntaxNode, source: string, language: string | null): BodyRef[] {
-  const params = collectText(stmt.namedChildren.find((c) => c?.type === 'func_args_with_defaults') ?? stmt, 'param_name', new Set());
   const atomic = stmt.descendantsOfType('opt_routine_body')[0];
-  if (atomic) return sqlTreeRefs(atomic, params);
+  if (atomic) return sqlTreeRefs(atomic);
   const funcAs = stmt.descendantsOfType('func_as')[0];
-  const range = funcAs ? bodyRange(funcAs.namedChildren.find((c) => c?.type === 'Sconst') ?? null) : null;
-  if (!range) return [];
-  if (language === 'plpgsql') return plpgsqlRefs(source, range, params);
-  if (language === 'sql') return sqlRefs(source, range, params);
+  const body = funcAs ? bodyRanges(funcAs.namedChildren.find((c) => c?.type === 'Sconst') ?? null) : null;
+  if (!body?.length) return [];
+  if (language === 'plpgsql') return plpgsqlRefs(source, body);
+  if (language === 'sql') return sqlRefs(source, body);
   return [];
 }
 
 /** References made by a DO block, whose language defaults to plpgsql. */
 export function doBlockRefs(stmt: SyntaxNode, source: string): BodyRef[] {
-  let range: Range | null = null;
+  let body: Range[] | null = null;
   let language = 'plpgsql';
   for (const item of stmt.descendantsOfType('dostmt_opt_item')) {
     const sconst = item?.namedChildren.find((c) => c?.type === 'Sconst');
-    if (sconst) range = bodyRange(sconst);
+    if (sconst) body = bodyRanges(sconst);
     else if (item) language = item.text.replace(/^language\s+/i, '').replace(/'/g, '').trim().toLowerCase();
   }
-  return range && language === 'plpgsql' ? plpgsqlRefs(source, range, new Set()) : [];
+  return body?.length && language === 'plpgsql' ? plpgsqlRefs(source, body) : [];
 }

@@ -175,6 +175,64 @@ describe('PostgreSQL trigger edges', () => {
     }
   });
 
+  it('ends a trigger only with a DROP statement, not with ALTER EXTENSION ... DROP FUNCTION', async () => {
+    const cg = await indexed({
+      'migrations/001_schema.sql': TABLE + triggerFn('on_insert') +
+        'CREATE TRIGGER orders_insert AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION on_insert();\n',
+      'migrations/002_writers.sql': writers + 'ALTER EXTENSION audit DROP FUNCTION on_insert();\n',
+    });
+    try {
+      expect(triggerEdges(cg)).toEqual([
+        'public::add_order -> public::on_insert [after insert row] public::orders::orders_insert @migrations/001_schema.sql:7',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  const doInsert = (id: number): string => `DO $$\nBEGIN\n  INSERT INTO orders (id) VALUES (${id});\nEND;\n$$;\n`;
+  const doDelete = 'DO $$\nBEGIN\n  DELETE FROM orders;\nEND;\n$$;\n';
+
+  it('fires, for a write a migration runs, only the triggers alive at that migration', async () => {
+    const cg = await indexed({
+      'migrations/001_schema.sql': TABLE + triggerFn('on_insert'),
+      'migrations/002_backfill.sql': doInsert(1) + writers,
+      'migrations/003_trigger.sql':
+        'CREATE TRIGGER orders_insert AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION on_insert();\n',
+      'migrations/004_backfill.sql': doInsert(2),
+      'migrations/005_drop.sql': 'DROP TRIGGER orders_insert ON orders;\n',
+      'migrations/006_backfill.sql': doInsert(3),
+    });
+    try {
+      expect(triggerEdges(cg)).toEqual([
+        'migrations/004_backfill.sql -> public::on_insert [after insert row] public::orders::orders_insert @migrations/003_trigger.sql:1',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('treats ALTER TABLE ... DISABLE TRIGGER as an end and ENABLE TRIGGER as a new start', async () => {
+    const cg = await indexed({
+      'migrations/001_schema.sql': TABLE + triggerFn('on_insert') + triggerFn('on_delete') +
+        'CREATE TRIGGER orders_insert AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION on_insert();\n' +
+        'CREATE TRIGGER orders_delete AFTER DELETE ON orders FOR EACH ROW EXECUTE FUNCTION on_delete();\n' +
+        'CREATE FUNCTION remove() RETURNS void LANGUAGE sql AS $$\n  DELETE FROM orders;\n$$;\n' + writers,
+      'migrations/002_disable.sql':
+        'ALTER TABLE orders DISABLE TRIGGER orders_insert;\nALTER TABLE ONLY public.orders DISABLE TRIGGER ALL;\n' +
+        doInsert(1) + doDelete,
+      'migrations/003_enable.sql': 'ALTER TABLE orders ENABLE TRIGGER orders_delete;\n' + doInsert(2) + doDelete,
+    });
+    try {
+      expect(triggerEdges(cg)).toEqual([
+        'migrations/003_enable.sql -> public::on_delete [after delete row] public::orders::orders_delete @migrations/001_schema.sql:13',
+        'public::remove -> public::on_delete [after delete row] public::orders::orders_delete @migrations/001_schema.sql:13',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('removes a trigger\'s edges when a sync redefines the trigger away', async () => {
     const cg = await indexed({
       'schema.sql': TABLE + triggerFn('on_insert') +

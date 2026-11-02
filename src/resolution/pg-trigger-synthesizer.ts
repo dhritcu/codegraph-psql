@@ -16,18 +16,26 @@
  * is an update too, and a MERGE performs the actions its WHEN clauses name.
  * A trigger's WHEN condition is not evaluated; it is recorded on the edge.
  *
- * Triggers apply in migration order like every other object: the latest
- * CREATE TRIGGER of a name on a table wins, and a later DROP TRIGGER leaves
- * none. The trigger's table and function are the ones its own edges were
- * resolved to, so a table dropped and created again keeps its triggers apart.
+ * Triggers apply in migration order like every other object, read from the
+ * Postgres resolver's one model of what a migration ends: the latest CREATE
+ * TRIGGER of a name on a table wins; a later DROP of the trigger, its table or
+ * its function leaves none; `ALTER TABLE ... DISABLE TRIGGER` stops it until
+ * an ENABLE. A write a migration runs itself (a DO block) fires the triggers
+ * in force at that point of its series. Every other write (a routine body,
+ * application code) runs once the migrations have applied, so it fires the
+ * triggers in force at the end. The trigger's table and function are the ones
+ * its own edges were resolved to, so a table dropped and created again keeps
+ * its triggers apart.
  */
 
 import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
-import { foldObjectName, qualify, splitIdentifierPath } from '../extraction/languages/postgres-names';
-import { makeLineAt } from './synth-utils';
+import { splitIdentifierPath } from '../extraction/languages/postgres-names';
+import {
+  codeOnly, comparePositions, ddlScope, IDENT, QUALIFIED, sqlDdlEvents, type SqlDdlEvent, type SqlPosition,
+} from './frameworks/postgres';
 
 type TriggerEvent = 'insert' | 'update' | 'delete' | 'truncate';
 
@@ -35,6 +43,8 @@ interface Trigger {
   node: Node;
   table: string;
   fn: string;
+  tableName: string;
+  fnName: string;
   timing: 'before' | 'after' | 'instead of';
   level: 'row' | 'statement';
   /** Each event the trigger fires on; an UPDATE OF list as its column set, any other event as null. */
@@ -49,8 +59,6 @@ interface WriteAction {
 }
 
 const SQL_FILE = /\.(?:sql|psql|pgsql)$/i;
-const IDENT = String.raw`(?:"(?:[^"]|"")*"|[A-Za-z_][\w$]*)`;
-const QUALIFIED = String.raw`${IDENT}(?:\s*\.\s*${IDENT}){0,2}`;
 
 const TRIGGER_HEAD = new RegExp(
   String.raw`^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+${IDENT}\s+(BEFORE|AFTER|INSTEAD\s+OF)\s+([\s\S]+?)\s+ON\s+`,
@@ -58,61 +66,10 @@ const TRIGGER_HEAD = new RegExp(
 );
 const TRIGGER_EVENT = /^(INSERT|UPDATE|DELETE|TRUNCATE)(?:\s+OF\s+([\s\S]+))?$/i;
 const TRIGGER_LEVEL = /\bFOR\s+(?:EACH\s+)?(ROW|STATEMENT)\b/i;
-const DROP_STATEMENT =
-  /\bdrop\s+(trigger|table|view|materialized\s+view|function|procedure|routine)\s+(?:if\s+exists\s+)?([^;]*)/gi;
-const DROPPED_TRIGGER = new RegExp(String.raw`^(${IDENT})\s+ON\s+(${QUALIFIED})`, 'i');
 const UPDATE_TARGET = new RegExp(
   String.raw`^${QUALIFIED}\s*\*?\s*(?:(?:AS\s+)?(?!SET\b)${IDENT}\s+)?SET\b`,
   'i'
 );
-
-/**
- * `text` with comments and single-quoted strings blanked, offsets and
- * newlines kept. With `dollarBodies`, routine bodies are blanked too, but a
- * DO block's body stays, since it runs as the migration applies; without,
- * the first dollar quote ends the text, as it ends the body a statement
- * inside a routine is read from.
- */
-function codeOnly(text: string, dollarBodies: boolean): string {
-  let out = '';
-  let copied = 0;
-  let i = 0;
-  let doClose: string | null = null;
-  while (i < text.length) {
-    const ch = text[i]!;
-    let end = -1;
-    if (ch === '-' && text[i + 1] === '-') {
-      end = text.indexOf('\n', i);
-      if (end < 0) end = text.length;
-    } else if (ch === '/' && text[i + 1] === '*') {
-      end = text.indexOf('*/', i + 2);
-      end = end < 0 ? text.length : end + 2;
-    } else if (ch === "'") {
-      end = i + 1;
-      while (end < text.length && !(text[end] === "'" && text[end + 1] !== "'")) end += text[end] === "'" ? 2 : 1;
-      end = Math.min(end + 1, text.length);
-    } else if (ch === '$') {
-      const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i, i + 64))?.[0];
-      if (tag && !dollarBodies) return out + text.slice(copied, i);
-      if (tag && (tag === doClose || (!doClose && /\bdo\s*$/i.test(text.slice(Math.max(0, i - 16), i))))) {
-        doClose = tag === doClose ? null : tag;
-        i += tag.length;
-        continue;
-      }
-      if (tag) {
-        const close = text.indexOf(tag, i + tag.length);
-        end = close < 0 ? text.length : close + tag.length;
-      }
-    }
-    if (end > i) {
-      out += text.slice(copied, i) + text.slice(i, end).replace(/[^\n]/g, ' ');
-      copied = i = end;
-    } else {
-      i++;
-    }
-  }
-  return out + text.slice(copied);
-}
 
 const columnName = (text: string): string | undefined => splitIdentifierPath(text.trim())[0];
 
@@ -259,112 +216,6 @@ function nodeText(ctx: ResolutionContext, node: Node): string | null {
   return span.join('\n');
 }
 
-/**
- * The migration series a file belongs to, as the Postgres resolver reads it:
- * its path up to the first part that starts with a sequence number, or its
- * directory when that is a `migrations` one; null for a file that is no migration.
- */
-function migrationSeries(filePath: string): string | null {
-  const parts = filePath.split('/');
-  const numbered = parts.findIndex((p) => /^\d+(?:[_\-.]|$)/.test(p));
-  if (numbered >= 0) return parts.slice(0, numbered).join('/');
-  const dir = parts.slice(0, -1);
-  return dir.some((p) => /^migrations?$/i.test(p)) ? dir.join('/') : null;
-}
-
-const naturalOrder = new Intl.Collator('en', { numeric: true }).compare;
-
-interface Position {
-  file: string;
-  line: number;
-}
-
-const after = (a: Position, b: Position): boolean =>
-  a.file === b.file ? a.line > b.line : naturalOrder(a.file, b.file) > 0;
-
-/**
- * What a DROP ends, as `<object class>:<qualified name>`, within one
- * migration series (or one unordered file): a DROP counts only there, as
- * it does for every other object.
- */
-const dropKey = (file: string, what: string): string => `${migrationSeries(file) ?? file}\0${what}`;
-
-/** `a.f(int, text), "B" CASCADE` → its qualified object names. */
-function droppedNames(list: string): string[] {
-  let names = list.replace(/\b(?:cascade|restrict)\s*$/i, '');
-  for (let prev = ''; prev !== names; ) {
-    prev = names;
-    names = names.replace(/\([^()]*\)/g, '');
-  }
-  return names
-    .split(',')
-    .map((n) => foldObjectName(n.trim()))
-    .filter((n): n is NonNullable<typeof n> => n !== null && n.name !== '')
-    .map((n) => qualify(n));
-}
-
-/**
- * Every DROP that ends a trigger: of the trigger itself, of its table (or
- * view), or of the function it runs, which takes the trigger with it.
- */
-function readDrops(ctx: ResolutionContext): Map<string, Position[]> {
-  const drops = new Map<string, Position[]>();
-  const add = (file: string, what: string, line: number): void => {
-    const key = dropKey(file, what);
-    const list = drops.get(key) ?? [];
-    list.push({ file, line });
-    drops.set(key, list);
-  };
-  for (const file of ctx.getAllFiles()) {
-    if (!SQL_FILE.test(file)) continue;
-    const text = ctx.readFile(file);
-    if (!text || !/\bdrop\s/i.test(text)) continue;
-    const code = codeOnly(text, true);
-    const lineAt = makeLineAt(code, 1);
-    for (const m of code.matchAll(DROP_STATEMENT)) {
-      const objectType = m[1]!.toLowerCase();
-      const line = lineAt(m.index!);
-      if (objectType === 'trigger') {
-        const t = DROPPED_TRIGGER.exec(m[2]!);
-        const name = t && columnName(t[1]!);
-        const table = t && foldObjectName(t[2]!);
-        if (name && table) add(file, `trigger:${qualify(table, name)}`, line);
-        continue;
-      }
-      const objectClass = objectType === 'function' || objectType === 'procedure' || objectType === 'routine' ? 'routine' : 'relation';
-      for (const name of droppedNames(m[2]!)) add(file, `${objectClass}:${name}`, line);
-    }
-  }
-  return drops;
-}
-
-/** The last CREATE TRIGGER of each name on a table. */
-function latestDefinitions(nodes: Node[]): Node[] {
-  const latest = new Map<string, Node>();
-  for (const node of nodes) {
-    const key = dropKey(node.filePath, `trigger:${node.qualifiedName}`);
-    const seen = latest.get(key);
-    if (!seen || after(at(node), at(seen))) latest.set(key, node);
-  }
-  return [...latest.values()];
-}
-
-/** The latest definitions still in force once every migration has applied: no DROP of the trigger, its table or its function comes after. */
-function liveTriggers(latest: Trigger[], ctx: ResolutionContext, queries: QueryBuilder): Trigger[] {
-  const drops = readDrops(ctx);
-  const live: Trigger[] = [];
-  for (const t of latest) {
-    const table = queries.getNodeById(t.table)?.qualifiedName;
-    const fn = queries.getNodeById(t.fn)?.qualifiedName;
-    const ends = [`trigger:${t.node.qualifiedName}`, `relation:${table}`, `routine:${fn}`]
-      .flatMap((what) => drops.get(dropKey(t.node.filePath, what)) ?? []);
-    if (!ends.some((d) => after(d, at(t.node)))) live.push(t);
-  }
-  return live;
-}
-
-const at = (node: Node): Position => ({ file: node.filePath, line: node.startLine });
-
 /** The table a trigger was resolved onto: its containing table, or the table its own reference names. */
 function tableOf(queries: QueryBuilder, trigger: Node): string | null {
   for (const e of queries.getIncomingEdges(trigger.id, ['contains'])) {
@@ -378,35 +229,78 @@ function tableOf(queries: QueryBuilder, trigger: Node): string | null {
 
 const WRITE_OPS = new Set(['insert', 'update', 'delete', 'merge']);
 
+const at = (node: Node): SqlPosition => ({ file: node.filePath, line: node.startLine });
+
+/**
+ * The definition among `defs` (one trigger's, in apply order) in force at
+ * `when`, or once every migration has applied when `when` is null: the latest
+ * created by then that no DROP of it, its table or its function, and no
+ * DISABLE TRIGGER without a later ENABLE, has ended by then.
+ */
+function inForce(defs: Trigger[], when: SqlPosition | null, ddl: Map<string, SqlDdlEvent[]>): Trigger | null {
+  const created = when ? defs.filter((d) => comparePositions(at(d.node), when) <= 0) : defs;
+  const def = created[created.length - 1];
+  if (!def) return null;
+  const scope = ddlScope(def.node.filePath);
+  const since = (e: SqlDdlEvent): boolean =>
+    ddlScope(e.at.file) === scope && comparePositions(e.at, at(def.node)) > 0 && (!when || comparePositions(e.at, when) <= 0);
+  const trigger = `trigger:${def.node.qualifiedName}`;
+  const ends = [trigger, `relation:${def.tableName}`, `routine:${def.fnName}`]
+    .some((key) => ddl.get(key)?.some((e) => e.kind === 'drop' && since(e)));
+  if (ends) return null;
+  const switches = [trigger, `triggers:${def.tableName}`]
+    .flatMap((key) => ddl.get(key) ?? [])
+    .filter((e) => e.kind !== 'drop' && since(e))
+    .sort((x, y) => comparePositions(x.at, y.at));
+  return switches[switches.length - 1]?.kind === 'disable' ? null : def;
+}
+
 export async function pgTriggerEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const nodes = ctx.getNodesByKind('method').filter((n) => n.language === 'postgres' && n.signature?.startsWith('trigger:'));
   if (nodes.length === 0) return [];
-  const triggers: Trigger[] = [];
-  for (const node of latestDefinitions(nodes)) {
+  // Every definition of one trigger in one series (or unordered file), in apply order.
+  const histories = new Map<string, Trigger[]>();
+  for (const node of nodes) {
     const text = nodeText(ctx, node);
     const head = text ? readTriggerHead(text) : null;
     const table = tableOf(queries, node);
     const fn = queries.getOutgoingEdges(node.id, ['calls'])[0]?.target;
-    if (head && table && fn) triggers.push({ node, table, fn, ...head });
+    const tableName = table && queries.getNodeById(table)?.qualifiedName;
+    const fnName = fn && queries.getNodeById(fn)?.qualifiedName;
+    if (!head || !table || !fn || !tableName || !fnName) continue;
+    const key = `${ddlScope(node.filePath)}\0${node.qualifiedName}`;
+    const defs = histories.get(key) ?? [];
+    defs.push({ node, table, fn, tableName, fnName, ...head });
+    histories.set(key, defs);
   }
-  const byTable = new Map<string, Trigger[]>();
-  for (const t of liveTriggers(triggers, ctx, queries)) {
-    const list = byTable.get(t.table) ?? [];
-    list.push(t);
-    byTable.set(t.table, list);
+  const byTable = new Map<string, Trigger[][]>();
+  for (const defs of histories.values()) {
+    defs.sort((x, y) => comparePositions(at(x.node), at(y.node)));
+    for (const table of new Set(defs.map((d) => d.table))) {
+      const list = byTable.get(table) ?? [];
+      list.push(defs);
+      byTable.set(table, list);
+    }
   }
+  const ddl = sqlDdlEvents(ctx);
   await onYield();
 
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const [table, triggers] of byTable) {
+  for (const [table, tableHistories] of byTable) {
     for (const write of queries.getIncomingEdges(table, ['references'])) {
       const op = write.metadata?.op;
       if (typeof op !== 'string' || !WRITE_OPS.has(op)) continue;
       const writer = queries.getNodeById(write.source);
       if (!writer) continue;
+      const runsAt = writer.kind === 'file' && SQL_FILE.test(writer.filePath) && write.line
+        ? { file: writer.filePath, line: write.line }
+        : null;
       const actions = writeActions(op, sqlStatementAt(ctx, writer, write), write.metadata?.columns);
-      for (const trigger of triggers) {
+      for (const defs of tableHistories) {
+        const when = runsAt && ddlScope(runsAt.file) === ddlScope(defs[0]!.node.filePath) ? runsAt : null;
+        const trigger = inForce(defs, when, ddl);
+        if (!trigger || trigger.table !== table) continue;
         const action = actions.find((a) => fires(trigger, a));
         const key = `${writer.id}>${trigger.fn}`;
         if (!action || trigger.fn === writer.id || seen.has(key)) continue;

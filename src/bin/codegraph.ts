@@ -77,6 +77,7 @@ import { buildTypeHierarchy, canHaveHierarchy, MAX_DESCENDANTS, MAX_DESCENDANT_D
 import { isTestCode } from '../graph/test-code';
 import type { Node, Edge, Language } from '../types';
 import { isTestPath } from '../search/query-utils';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -478,6 +479,10 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     for (const warning of parseWarnings) {
       clack.log.warn(warning.message);
     }
+    const oversize = describeSkippedForSize(
+      result.errors.filter((e) => e.code === 'size_exceeded' && e.filePath).map((e) => e.filePath!)
+    );
+    if (oversize) clack.log.warn(oversize);
     // A PARTIAL index (files silently dropped mid-pipeline) must not pass
     // as a clean run — it's the difference between "indexed the repo" and
     // "indexed most of the repo, quietly". Only the completeness
@@ -1131,6 +1136,14 @@ function samplePaths(paths: string[]): string {
   return paths.slice(0, 3).join(', ') + (paths.length > 3 ? ` (+${formatNumber(paths.length - 3)} more)` : '');
 }
 
+/** The warning for files stored without being parsed because they are over the size limit. */
+function describeSkippedForSize(paths: string[]): string | null {
+  if (paths.length === 0) return null;
+  const mib = MAX_SOURCE_FILE_SIZE_BYTES / (1024 * 1024);
+  return `${formatNumber(paths.length)} ${paths.length === 1 ? 'file was' : 'files were'} skipped for size (over ${mib} MiB), ` +
+    `so ${paths.length === 1 ? 'its symbols are' : 'their symbols are'} missing: ${samplePaths(paths)}`;
+}
+
 /**
  * The `status` warnings for indexed files whose symbols are missing although
  * their content is current (#2335, #2336): one line per group, saying what is
@@ -1297,6 +1310,7 @@ program
             // Files with a recorded parse error and no symbols from it
             // (#2336); unchanged until the file or the parser changes.
             filesWithParseErrors: health.parseErrors.length,
+            filesSkippedForSize: health.skippedForSize.length,
           },
         }));
         cg.destroy();
@@ -1420,6 +1434,8 @@ program
       if (totalChanges === 0 && missingSymbols.length === 0) {
         success('Index is up to date');
       }
+      const oversize = describeSkippedForSize(health.skippedForSize);
+      if (oversize) warn(oversize);
       console.log();
 
       // Re-index hint: the index was built by an older engine than the one now
