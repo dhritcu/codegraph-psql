@@ -37,6 +37,7 @@ import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { postgresResolver } from './postgres';
 
 /**
  * All registered framework resolvers
@@ -102,6 +103,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // PostgreSQL — exact `schema::name`, latest migration wins, DROP removes
+  postgresResolver,
 ];
 
 /**

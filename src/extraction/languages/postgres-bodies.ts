@@ -21,11 +21,20 @@ import { foldObjectName, splitIdentifierPath, type SqlName } from './postgres-na
 export type SqlOp = 'select' | 'insert' | 'update' | 'delete' | 'merge';
 
 /**
- * Prefix of the `candidates` entry that carries a table reference's operation
- * (`sql-op:insert`) through the unresolved-reference store to the resolver,
- * which has no other field for it.
+ * A body's table reference names its operation ahead of the table,
+ * `insert:public::orders`. The name is the one part of a reference that every
+ * store keeps, so the operation reaches the resolver from a fresh index and
+ * from an edge a sync turns back into a reference alike.
  */
-export const SQL_OP_CANDIDATE = 'sql-op:';
+export const opReferenceName = (op: SqlOp, qualifiedName: string): string => `${op}:${qualifiedName}`;
+
+const OP_PREFIX = /^(select|insert|update|delete|merge):(?!:)/;
+
+/** `insert:public::orders` → insert on `public::orders`; a name with no operation comes back as it is. */
+export function splitOpReferenceName(name: string): { op?: SqlOp; qualifiedName: string } {
+  const m = OP_PREFIX.exec(name);
+  return m ? { op: m[1] as SqlOp, qualifiedName: name.slice(m[0].length) } : { qualifiedName: name };
+}
 
 export interface BodyRef {
   target: SqlName;
