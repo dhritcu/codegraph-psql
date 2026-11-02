@@ -58,10 +58,9 @@ const TRIGGER_HEAD = new RegExp(
 );
 const TRIGGER_EVENT = /^(INSERT|UPDATE|DELETE|TRUNCATE)(?:\s+OF\s+([\s\S]+))?$/i;
 const TRIGGER_LEVEL = /\bFOR\s+(?:EACH\s+)?(ROW|STATEMENT)\b/i;
-const DROP_TRIGGER = new RegExp(
-  String.raw`(?:^|;)\s*DROP\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?(${IDENT})\s+ON\s+(${QUALIFIED})`,
-  'gi'
-);
+const DROP_STATEMENT =
+  /\bdrop\s+(trigger|table|view|materialized\s+view|function|procedure|routine)\s+(?:if\s+exists\s+)?([^;]*)/gi;
+const DROPPED_TRIGGER = new RegExp(String.raw`^(${IDENT})\s+ON\s+(${QUALIFIED})`, 'i');
 const UPDATE_TARGET = new RegExp(
   String.raw`^${QUALIFIED}\s*\*?\s*(?:(?:AS\s+)?(?!SET\b)${IDENT}\s+)?SET\b`,
   'i'
@@ -69,14 +68,16 @@ const UPDATE_TARGET = new RegExp(
 
 /**
  * `text` with comments and single-quoted strings blanked, offsets and
- * newlines kept. With `dollarBodies`, dollar-quoted bodies are blanked too;
- * without, the first dollar quote ends the text, as it ends the body a
- * statement inside a routine is read from.
+ * newlines kept. With `dollarBodies`, routine bodies are blanked too, but a
+ * DO block's body stays, since it runs as the migration applies; without,
+ * the first dollar quote ends the text, as it ends the body a statement
+ * inside a routine is read from.
  */
 function codeOnly(text: string, dollarBodies: boolean): string {
   let out = '';
   let copied = 0;
   let i = 0;
+  let doClose: string | null = null;
   while (i < text.length) {
     const ch = text[i]!;
     let end = -1;
@@ -93,6 +94,11 @@ function codeOnly(text: string, dollarBodies: boolean): string {
     } else if (ch === '$') {
       const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i, i + 64))?.[0];
       if (tag && !dollarBodies) return out + text.slice(copied, i);
+      if (tag && (tag === doClose || (!doClose && /\bdo\s*$/i.test(text.slice(Math.max(0, i - 16), i))))) {
+        doClose = tag === doClose ? null : tag;
+        i += tag.length;
+        continue;
+      }
       if (tag) {
         const close = text.indexOf(tag, i + tag.length);
         end = close < 0 ? text.length : close + tag.length;
@@ -268,51 +274,96 @@ function migrationSeries(filePath: string): string | null {
 
 const naturalOrder = new Intl.Collator('en', { numeric: true }).compare;
 
-interface TriggerEventAt {
+interface Position {
   file: string;
   line: number;
-  node: Node | null;
 }
 
-/** Definitions of one trigger in one migration series (or one unordered file) share a key. */
-const historyKey = (file: string, qualifiedName: string): string => `${migrationSeries(file) ?? file}\0${qualifiedName}`;
+const after = (a: Position, b: Position): boolean =>
+  a.file === b.file ? a.line > b.line : naturalOrder(a.file, b.file) > 0;
 
-/** Every top-level DROP TRIGGER, keyed like the definitions it ends. */
-function readDrops(ctx: ResolutionContext, into: Map<string, TriggerEventAt[]>): void {
+/**
+ * What a DROP ends, as `<object class>:<qualified name>`, within one
+ * migration series (or one unordered file): a DROP counts only there, as
+ * it does for every other object.
+ */
+const dropKey = (file: string, what: string): string => `${migrationSeries(file) ?? file}\0${what}`;
+
+/** `a.f(int, text), "B" CASCADE` → its qualified object names. */
+function droppedNames(list: string): string[] {
+  let names = list.replace(/\b(?:cascade|restrict)\s*$/i, '');
+  for (let prev = ''; prev !== names; ) {
+    prev = names;
+    names = names.replace(/\([^()]*\)/g, '');
+  }
+  return names
+    .split(',')
+    .map((n) => foldObjectName(n.trim()))
+    .filter((n): n is NonNullable<typeof n> => n !== null && n.name !== '')
+    .map((n) => qualify(n));
+}
+
+/**
+ * Every DROP that ends a trigger: of the trigger itself, of its table (or
+ * view), or of the function it runs, which takes the trigger with it.
+ */
+function readDrops(ctx: ResolutionContext): Map<string, Position[]> {
+  const drops = new Map<string, Position[]>();
+  const add = (file: string, what: string, line: number): void => {
+    const key = dropKey(file, what);
+    const list = drops.get(key) ?? [];
+    list.push({ file, line });
+    drops.set(key, list);
+  };
   for (const file of ctx.getAllFiles()) {
     if (!SQL_FILE.test(file)) continue;
     const text = ctx.readFile(file);
-    if (!text || !/drop\s+trigger/i.test(text)) continue;
+    if (!text || !/\bdrop\s/i.test(text)) continue;
     const code = codeOnly(text, true);
     const lineAt = makeLineAt(code, 1);
-    for (const m of code.matchAll(DROP_TRIGGER)) {
-      const name = columnName(m[1]!);
-      const table = foldObjectName(m[2]!);
-      if (!name || !table) continue;
-      const list = into.get(historyKey(file, qualify(table, name)));
-      list?.push({ file, line: lineAt(m.index! + m[0].search(/drop/i)), node: null });
+    for (const m of code.matchAll(DROP_STATEMENT)) {
+      const objectType = m[1]!.toLowerCase();
+      const line = lineAt(m.index!);
+      if (objectType === 'trigger') {
+        const t = DROPPED_TRIGGER.exec(m[2]!);
+        const name = t && columnName(t[1]!);
+        const table = t && foldObjectName(t[2]!);
+        if (name && table) add(file, `trigger:${qualify(table, name)}`, line);
+        continue;
+      }
+      const objectClass = objectType === 'function' || objectType === 'procedure' || objectType === 'routine' ? 'routine' : 'relation';
+      for (const name of droppedNames(m[2]!)) add(file, `${objectClass}:${name}`, line);
     }
   }
+  return drops;
 }
 
-/** The trigger nodes still defined once every migration has applied. */
-function liveTriggers(nodes: Node[], ctx: ResolutionContext): Node[] {
-  const histories = new Map<string, TriggerEventAt[]>();
+/** The last CREATE TRIGGER of each name on a table. */
+function latestDefinitions(nodes: Node[]): Node[] {
+  const latest = new Map<string, Node>();
   for (const node of nodes) {
-    const key = historyKey(node.filePath, node.qualifiedName);
-    const list = histories.get(key) ?? [];
-    list.push({ file: node.filePath, line: node.startLine, node });
-    histories.set(key, list);
+    const key = dropKey(node.filePath, `trigger:${node.qualifiedName}`);
+    const seen = latest.get(key);
+    if (!seen || after(at(node), at(seen))) latest.set(key, node);
   }
-  readDrops(ctx, histories);
-  const live: Node[] = [];
-  for (const events of histories.values()) {
-    events.sort((a, b) => (a.file === b.file ? a.line - b.line : naturalOrder(a.file, b.file)));
-    const last = events[events.length - 1]!.node;
-    if (last) live.push(last);
+  return [...latest.values()];
+}
+
+/** The latest definitions still in force once every migration has applied: no DROP of the trigger, its table or its function comes after. */
+function liveTriggers(latest: Trigger[], ctx: ResolutionContext, queries: QueryBuilder): Trigger[] {
+  const drops = readDrops(ctx);
+  const live: Trigger[] = [];
+  for (const t of latest) {
+    const table = queries.getNodeById(t.table)?.qualifiedName;
+    const fn = queries.getNodeById(t.fn)?.qualifiedName;
+    const ends = [`trigger:${t.node.qualifiedName}`, `relation:${table}`, `routine:${fn}`]
+      .flatMap((what) => drops.get(dropKey(t.node.filePath, what)) ?? []);
+    if (!ends.some((d) => after(d, at(t.node)))) live.push(t);
   }
   return live;
 }
+
+const at = (node: Node): Position => ({ file: node.filePath, line: node.startLine });
 
 /** The table a trigger was resolved onto: its containing table, or the table its own reference names. */
 function tableOf(queries: QueryBuilder, trigger: Node): string | null {
@@ -330,16 +381,19 @@ const WRITE_OPS = new Set(['insert', 'update', 'delete', 'merge']);
 export async function pgTriggerEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const nodes = ctx.getNodesByKind('method').filter((n) => n.language === 'postgres' && n.signature?.startsWith('trigger:'));
   if (nodes.length === 0) return [];
-  const byTable = new Map<string, Trigger[]>();
-  for (const node of liveTriggers(nodes, ctx)) {
+  const triggers: Trigger[] = [];
+  for (const node of latestDefinitions(nodes)) {
     const text = nodeText(ctx, node);
     const head = text ? readTriggerHead(text) : null;
     const table = tableOf(queries, node);
     const fn = queries.getOutgoingEdges(node.id, ['calls'])[0]?.target;
-    if (!head || !table || !fn) continue;
-    const list = byTable.get(table) ?? [];
-    list.push({ node, table, fn, ...head });
-    byTable.set(table, list);
+    if (head && table && fn) triggers.push({ node, table, fn, ...head });
+  }
+  const byTable = new Map<string, Trigger[]>();
+  for (const t of liveTriggers(triggers, ctx, queries)) {
+    const list = byTable.get(t.table) ?? [];
+    list.push(t);
+    byTable.set(t.table, list);
   }
   await onYield();
 

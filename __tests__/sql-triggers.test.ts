@@ -151,6 +151,30 @@ describe('PostgreSQL trigger edges', () => {
     }
   });
 
+  it('ends a trigger with its table, with its function, and with a DROP in a DO block, not one in a routine body', async () => {
+    const cg = await indexed({
+      'migrations/001_schema.sql': TABLE + 'CREATE TABLE gone (id int);\nCREATE TABLE kept (id int);\n' +
+        triggerFn('on_gone') + triggerFn('on_cascade') + triggerFn('on_do') + triggerFn('on_kept') +
+        'CREATE TRIGGER gone_insert AFTER INSERT ON gone FOR EACH ROW EXECUTE FUNCTION on_gone();\n' +
+        'CREATE TRIGGER orders_cascade AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION on_cascade();\n' +
+        'CREATE TRIGGER orders_do AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION on_do();\n' +
+        'CREATE TRIGGER kept_insert AFTER INSERT ON kept FOR EACH ROW EXECUTE FUNCTION on_kept();\n' +
+        'CREATE FUNCTION fill() RETURNS void LANGUAGE sql AS $$\n  INSERT INTO gone (id) VALUES (1);\n  INSERT INTO orders (id) VALUES (1);\n  INSERT INTO kept (id) VALUES (1);\n$$;\n',
+      'migrations/002_drops.sql':
+        'DROP TABLE IF EXISTS gone CASCADE;\n' +
+        'DROP FUNCTION IF EXISTS on_cascade() CASCADE;\n' +
+        'DO $$\nBEGIN\n  IF true THEN\n    DROP TRIGGER IF EXISTS orders_do ON orders;\n  END IF;\nEND;\n$$;\n' +
+        "CREATE FUNCTION later() RETURNS void LANGUAGE plpgsql AS $f$\nBEGIN\n  DROP TRIGGER kept_insert ON kept;\nEND;\n$f$;\n",
+    });
+    try {
+      expect(triggerEdges(cg)).toEqual([
+        'public::fill -> public::on_kept [after insert row] public::kept::kept_insert @migrations/001_schema.sql:27',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('removes a trigger\'s edges when a sync redefines the trigger away', async () => {
     const cg = await indexed({
       'schema.sql': TABLE + triggerFn('on_insert') +
