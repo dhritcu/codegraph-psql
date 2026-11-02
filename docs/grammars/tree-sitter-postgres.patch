@@ -1,0 +1,374 @@
+diff --git a/plpgsql/grammar.js b/plpgsql/grammar.js
+index 53404d9..847c950 100644
+--- a/plpgsql/grammar.js
++++ b/plpgsql/grammar.js
+@@ -135,10 +135,11 @@ module.exports = grammar({
+ 
+     // Type names — simplified; covers most PL/pgSQL usage
+     type_name: $ => choice(
+-      // variable%TYPE / table.column%TYPE
+-      seq($.dotted_name, '%', $.kw_type),
++      // variable%TYPE / table.column%TYPE, with PG 17's optional array
++      // suffix: v%TYPE[], v%TYPE ARRAY[1], r%ROWTYPE[1][3]
++      seq($.dotted_name, '%', $.kw_type, optional($._array_suffix)),
+       // variable%ROWTYPE / table%ROWTYPE
+-      seq($.dotted_name, '%', $.kw_rowtype),
++      seq($.dotted_name, '%', $.kw_rowtype, optional($._array_suffix)),
+       // Regular type: name or schema.name, with optional multi-word modifiers
+       // (e.g. `character varying`, `double precision`, `timestamp with time
+       // zone`), precision specifiers, and array modifiers. Trailing words are
+@@ -150,10 +151,17 @@ module.exports = grammar({
+           $.identifier,
+           seq('(', $.integer_literal, optional(seq(',', $.integer_literal)), ')')
+         )),
+-        repeat(seq('[', optional($.integer_literal), ']'))
++        optional($._array_suffix)
+       )
+     ),
+ 
++    _array_suffix: $ => choice(
++      seq(optional($.kw_array), repeat1($._array_bounds)),
++      $.kw_array
++    ),
++
++    _array_bounds: $ => seq('[', optional($.integer_literal), ']'),
++
+     dotted_name: $ => seq(
+       $.any_identifier,
+       repeat(seq('.', $.any_identifier))
+@@ -281,10 +289,15 @@ module.exports = grammar({
+     ),
+ 
+     for_variable: $ => seq(
+-      $.any_identifier,
+-      repeat(seq(',', $.any_identifier))
++      $._for_target,
++      repeat(seq(',', $._for_target))
+     ),
+ 
++    // A target may be qualified by a block label: FOR lbl.a, lbl.b IN ...
++    _for_target: $ => choice($.any_identifier, $.qualified_identifier),
++
++    qualified_identifier: $ => seq($.any_identifier, repeat1(seq('.', $.any_identifier))),
++
+     for_integer_range: $ => seq(
+       optional($.kw_reverse),
+       $._sql_range_expr, '..', $._sql_by_or_loop_expr,
+@@ -451,7 +464,7 @@ module.exports = grammar({
+     // ── OPEN cursor ───────────────────────────────────────────────────────────
+     stmt_open: $ => seq(
+       $.kw_open,
+-      $.any_identifier,
++      $._cursor_variable,
+       optional(choice(
+         // Unbound cursor: OPEN cur [NO SCROLL | SCROLL] FOR query|EXECUTE expr
+         seq(
+@@ -476,7 +489,7 @@ module.exports = grammar({
+       $.kw_fetch,
+       optional($.fetch_direction),
+       optional($.kw_from),
+-      $.any_identifier,
++      $._cursor_variable,
+       $.kw_into,
+       $.into_target,
+       ';'
+@@ -486,7 +499,7 @@ module.exports = grammar({
+     stmt_move: $ => seq(
+       $.kw_move,
+       optional($.fetch_direction),
+-      $.any_identifier,
++      $._cursor_variable,
+       ';'
+     ),
+ 
+@@ -504,7 +517,11 @@ module.exports = grammar({
+     ),
+ 
+     // ── CLOSE ─────────────────────────────────────────────────────────────────
+-    stmt_close: $ => seq($.kw_close, $.any_identifier, ';'),
++    stmt_close: $ => seq($.kw_close, $._cursor_variable, ';'),
++
++    // pl_gram.y cursor_variable is T_DATUM: any variable in scope, including a
++    // positional parameter such as $1. The refcursor type check is semantic.
++    _cursor_variable: $ => choice($.any_identifier, $.param),
+ 
+     // ── NULL statement ────────────────────────────────────────────────────────
+     stmt_null: $ => seq($.kw_null, ';'),
+@@ -593,7 +610,8 @@ module.exports = grammar({
+     // ── Common helpers ────────────────────────────────────────────────────────
+     any_identifier: $ => choice(
+       $.identifier,
+-      $.unreserved_keyword
++      $.unreserved_keyword,
++      $.quoted_identifier
+     ),
+ 
+     // ── Keyword category lists ────────────────────────────────────────────────
+@@ -826,6 +844,9 @@ module.exports = grammar({
+ 
+     identifier: _ => token(prec(0, /[a-zA-Z_\u0080-\u00ff][a-zA-Z0-9_$\u0080-\u00ff]*/)),
+ 
++    // "C", "MyTable": a doubled quote is the escape.
++    quoted_identifier: _ => token(/"([^"]|"")+"/),
++
+     // Positional parameter reference ($1, $2, ...) \u2014 used as an ALIAS target.
+     param: _ => token(/\$[0-9]+/),
+ 
+diff --git a/plpgsql/test/corpus/declarations.txt b/plpgsql/test/corpus/declarations.txt
+index 2ec9e00..e817acd 100644
+--- a/plpgsql/test/corpus/declarations.txt
++++ b/plpgsql/test/corpus/declarations.txt
+@@ -378,3 +378,126 @@ END
+         (stmt_null
+           (kw_null))))
+     (kw_end)))
++
++==================
++COLLATE with a quoted collation name
++==================
++
++DECLARE
++  last_name TEXT COLLATE "C" := NULL;
++BEGIN
++  NULL;
++END
++
++---
++
++(source_file
++  (pl_block
++    (decl_sect
++      (kw_declare)
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier)))))
++          (decl_collate
++            (kw_collate)
++            (dotted_name
++              (any_identifier
++                (quoted_identifier))))
++          (decl_defval
++            (sql_expression)))))
++    (kw_begin)
++    (proc_sect
++      (proc_stmt
++        (stmt_null
++          (kw_null))))
++    (kw_end)))
++
++==================
++%TYPE and %ROWTYPE with an array suffix
++==================
++
++DECLARE
++  v2 v%type[];
++  v3 v%TYPE[1][3];
++  v4 v%type ARRAY[1][1];
++  r2 pg_catalog.pg_class%rowtype[];
++  a integer ARRAY;
++BEGIN
++  NULL;
++END
++
++---
++
++(source_file
++  (pl_block
++    (decl_sect
++      (kw_declare)
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier)))
++              (kw_type)))))
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier)))
++              (kw_type)
++              (integer_literal)
++              (integer_literal)))))
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier)))
++              (kw_type)
++              (kw_array)
++              (integer_literal)
++              (integer_literal)))))
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier))
++                (any_identifier
++                  (identifier)))
++              (kw_rowtype)))))
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier)))
++              (kw_array))))))
++    (kw_begin)
++    (proc_sect
++      (proc_stmt
++        (stmt_null
++          (kw_null))))
++    (kw_end)))
+diff --git a/plpgsql/test/corpus/loops.txt b/plpgsql/test/corpus/loops.txt
+index e5fb7e4..e8584bc 100644
+--- a/plpgsql/test/corpus/loops.txt
++++ b/plpgsql/test/corpus/loops.txt
+@@ -217,3 +217,70 @@ END
+             (kw_end)
+             (kw_loop)))))
+     (kw_end)))
++
++==================
++FOR targets qualified by the top-level block label
++==================
++
++<<lbl>>declare a integer; b varchar;
++begin
++  for lbl.a, lbl.b in execute 'select 1, 2' loop
++    null;
++  end loop;
++end
++
++---
++
++(source_file
++  (pl_block
++    (block_label
++      (identifier))
++    (decl_sect
++      (kw_declare)
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier)))))))
++      (decl_stmt
++        (decl_statement
++          (decl_varname
++            (identifier))
++          (decl_datatype
++            (type_name
++              (dotted_name
++                (any_identifier
++                  (identifier))))))))
++    (kw_begin)
++    (proc_sect
++      (proc_stmt
++        (stmt_for
++          (kw_for)
++          (for_variable
++            (qualified_identifier
++              (any_identifier
++                (identifier))
++              (any_identifier
++                (identifier)))
++            (qualified_identifier
++              (any_identifier
++                (identifier))
++              (any_identifier
++                (identifier))))
++          (kw_in)
++          (for_dynamic
++            (kw_execute)
++            (sql_expression)
++            (kw_loop))
++          (loop_body
++            (proc_sect
++              (proc_stmt
++                (stmt_null
++                  (kw_null))))
++            (kw_end)
++            (kw_loop)))))
++    (kw_end)))
+diff --git a/postgres/grammar.js b/postgres/grammar.js
+index 3d43155..3139836 100644
+--- a/postgres/grammar.js
++++ b/postgres/grammar.js
+@@ -2186,11 +2186,11 @@ module.exports = grammar({
+         seq($.merge_when_list, $.merge_when_clause)
+       ),
+     merge_when_clause: $ => choice(
+-        seq($.merge_when_tgt_matched, $.opt_merge_when_condition, $.kw_then, $.merge_update),
+-        seq($.merge_when_tgt_matched, $.opt_merge_when_condition, $.kw_then, $.merge_delete),
+-        seq($.merge_when_tgt_not_matched, $.opt_merge_when_condition, $.kw_then, $.merge_insert),
+-        seq($.merge_when_tgt_matched, $.opt_merge_when_condition, $.kw_then, $.kw_do, $.kw_nothing),
+-        seq($.merge_when_tgt_not_matched, $.opt_merge_when_condition, $.kw_then, $.kw_do, $.kw_nothing)
++        seq($.merge_when_tgt_matched, optional($.opt_merge_when_condition), $.kw_then, $.merge_update),
++        seq($.merge_when_tgt_matched, optional($.opt_merge_when_condition), $.kw_then, $.merge_delete),
++        seq($.merge_when_tgt_not_matched, optional($.opt_merge_when_condition), $.kw_then, $.merge_insert),
++        seq($.merge_when_tgt_matched, optional($.opt_merge_when_condition), $.kw_then, $.kw_do, $.kw_nothing),
++        seq($.merge_when_tgt_not_matched, optional($.opt_merge_when_condition), $.kw_then, $.kw_do, $.kw_nothing)
+       ),
+     merge_when_tgt_matched: $ => choice(
+         seq($.kw_when, $.kw_matched),
+@@ -4751,7 +4751,7 @@ module.exports = grammar({
+     // ── String literals ──────────────────────────────────────────────────────────
+ 
+     // Standard SQL string: 'hello' — doubled single-quote is the escape: 'it''s'
+-    string_literal: _ => token(/'([^']|'')*'/),
++    string_literal: _ => token(/'([^']|'')*'(([ \t\f\v]|--[^\n\r]*)*[\n\r]([ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'([^']|'')*')*/),
+ 
+     // Escape string: E'...' (or e'...') — backslash escapes apply, so \' is an
+     // escaped quote and does not terminate the string (unlike a standard
+@@ -4759,7 +4759,7 @@ module.exports = grammar({
+     // lexer prefers this over the bare E identifier by longest match. Content
+     // is any non-quote/non-backslash char, a doubled quote, or a backslash
+     // escape. ruleutils emits E'...' for any string containing backslashes.
+-    escape_string_literal: _ => token(/[eE]'([^'\\]|''|\\.)*'/),
++    escape_string_literal: _ => token(/[eE]'([^'\\]|''|\\.)*'(([ \t\f\v]|--[^\n\r]*)*[\n\r]([ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'([^'\\]|''|\\.)*')*/),
+ 
+     // NOTE: N'...' and U&'...' prefix strings are still parsed as
+     // function-call-like forms (identifier + string_literal).
+@@ -4772,10 +4772,10 @@ module.exports = grammar({
+     // strings in a single file.
+ 
+     // Bit string: B'0101'
+-    bit_string_literal: _ => token(/[bB]'[01]*'/),
++    bit_string_literal: _ => token(/[bB]'[01]*'(([ \t\f\v]|--[^\n\r]*)*[\n\r]([ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'[01]*')*/),
+ 
+     // Hex string: X'deadbeef'
+-    hex_string_literal: _ => token(/[xX]'[0-9a-fA-F]*'/),
++    hex_string_literal: _ => token(/[xX]'[0-9a-fA-F]*'(([ \t\f\v]|--[^\n\r]*)*[\n\r]([ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'[0-9a-fA-F]*')*/),
+ 
+     // ── Operators ────────────────────────────────────────────────────────────────
+ 
