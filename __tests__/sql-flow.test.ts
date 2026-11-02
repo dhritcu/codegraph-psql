@@ -181,6 +181,21 @@ describe('SQL tables on the node, callers and impact surfaces', () => {
     }
   });
 
+  it('keeps overloads in one file as separate definitions', async () => {
+    const cg = await indexed({
+      'migrations/001_init.sql':
+        'CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE sql AS $$ SELECT a + b $$;\n' +
+        "CREATE FUNCTION add(a text, b text) RETURNS text LANGUAGE sql AS $$ SELECT a || b $$;\n",
+    });
+    try {
+      const node = await tool(cg, 'codegraph_node', { symbol: 'add' });
+      expect(node.startsWith('**2 definitions named "add"**')).toBe(true);
+      expect(node).not.toContain('Superseded');
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('names a missing table in the viewer without the operation prefix', async () => {
     const cg = await indexed({
       'migrations/001_init.sql':

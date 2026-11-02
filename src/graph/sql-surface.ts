@@ -80,33 +80,44 @@ function applyOrder(a: Node, b: Node): number {
   return a.filePath === b.filePath ? a.startLine - b.startLine : naturalOrder(a.filePath, b.filePath);
 }
 
+/** The migration series a file applies in: its path up to the first numbered segment. */
+function migrationSeries(filePath: string): string {
+  const parts = filePath.split('/');
+  const numbered = parts.findIndex((p) => /^\d+(?:[_\-.]|$)/.test(p));
+  return (numbered >= 0 ? parts.slice(0, numbered) : parts.slice(0, -1)).join('/');
+}
+
 /**
  * Each SQL object once, at its live (latest) definition, with the definitions
- * it superseded. Non-SQL nodes pass through untouched, in their own order; the
- * live definition takes the place of the first of its copies.
+ * it superseded. Only copies in different files of one migration series are
+ * one object's history: two definitions in one file are overloads, which the
+ * qualified name does not tell apart. Non-SQL nodes pass through untouched, in
+ * their own order; the live definition takes the place of the first of its copies.
  */
 export function liveSqlDefinitions(nodes: readonly Node[]): { nodes: Node[]; superseded: Map<string, Node[]> } {
+  const keyOf = (node: Node) => `${node.kind}|${node.qualifiedName}|${migrationSeries(node.filePath)}`;
   const copies = new Map<string, Node[]>();
   for (const node of nodes) {
-    if (!isSqlNode(node)) continue;
-    const key = `${node.kind}|${node.qualifiedName}`;
-    copies.set(key, [...(copies.get(key) ?? []), node]);
+    if (isSqlNode(node)) copies.set(keyOf(node), [...(copies.get(keyOf(node)) ?? []), node]);
+  }
+  for (const [key, all] of copies) {
+    if (new Set(all.map((n) => n.filePath)).size < all.length) copies.delete(key);
   }
   const superseded = new Map<string, Node[]>();
   const out: Node[] = [];
   const placed = new Set<string>();
   for (const node of nodes) {
-    if (!isSqlNode(node)) {
+    const all = isSqlNode(node) ? copies.get(keyOf(node)) : undefined;
+    if (!all) {
       out.push(node);
       continue;
     }
-    const key = `${node.kind}|${node.qualifiedName}`;
-    if (placed.has(key)) continue;
-    placed.add(key);
-    const all = [...copies.get(key)!].sort(applyOrder);
-    const live = all[all.length - 1]!;
+    if (placed.has(keyOf(node))) continue;
+    placed.add(keyOf(node));
+    const ordered = [...all].sort(applyOrder);
+    const live = ordered[ordered.length - 1]!;
     out.push(live);
-    if (all.length > 1) superseded.set(live.id, all.slice(0, -1).reverse());
+    if (ordered.length > 1) superseded.set(live.id, ordered.slice(0, -1).reverse());
   }
   return { nodes: out, superseded };
 }

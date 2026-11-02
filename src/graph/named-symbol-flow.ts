@@ -338,9 +338,11 @@ export function resolveNamedTokens(
     const kept = directed
       ? rankForDirected(pick).slice(0, MAX_CANDIDATES_DIRECTED)
       : pick.slice(0, MAX_CANDIDATES_PER_TOKEN);
-    const tables = directed ? [] : sqlTablesOf(hits);
-    out.tokenNodes.set(t, [...kept, ...tables].map((n) => n.id));
-    for (const n of tables) out.tables.set(n.id, n);
+    out.tokenNodes.set(
+      t,
+      kept.map((n) => n.id)
+    );
+    if (!directed) for (const n of sqlTablesOf(hits)) out.tables.set(n.id, n);
     const precise = isPreciseToken(t);
     for (const n of kept) {
       out.named.set(n.id, n);
