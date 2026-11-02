@@ -472,6 +472,7 @@ function makeDeps(
     warn: (m) => calls.logs.push(m),
     error: (m) => calls.errors.push(m),
     platform: overrides.platform ?? 'linux',
+    upstreamUpgrade: overrides.upstreamUpgrade ?? true,
   };
   return { deps, calls };
 }
@@ -652,6 +653,60 @@ describe('runUpgrade', () => {
     expect(code).toBe(0);
     expect(calls.runs).toHaveLength(0);
     expect(calls.logs.join('\n')).toMatch(/git pull/);
+  });
+});
+
+describe('runUpgrade fork guard', () => {
+  const refusal =
+    'This is the codegraph-psql fork. `codegraph upgrade` would replace it with upstream CodeGraph, so it is disabled.';
+  const methods: InstallMethod[] = [
+    { kind: 'bundle', os: 'unix', bundleRoot: '/h/.codegraph/versions/v0.9.8', installDir: '/h/.codegraph' },
+    { kind: 'bundle', os: 'windows', bundleRoot: 'C:/x/codegraph/current', installDir: 'C:/x/codegraph' },
+    { kind: 'npm', scope: 'global' },
+    { kind: 'npx' },
+    { kind: 'package-manager', manager: 'pnpm', global: true },
+    { kind: 'unknown', reason: 'test' },
+  ];
+
+  it.each(methods.map((m) => [m.kind, m] as const))('%s install refuses without touching the network', async (_kind, method) => {
+    let resolved = false;
+    const { deps, calls } = makeDeps({
+      method,
+      currentVersion: '0.9.8',
+      upstreamUpgrade: false,
+      resolveLatest: async () => {
+        resolved = true;
+        return 'v0.9.9';
+      },
+    });
+    expect(await runUpgrade({}, deps)).toBe(1);
+    expect(calls.errors).toEqual([refusal]);
+    expect(calls.runs).toEqual([]);
+    expect(calls.promptHookWires).toBe(0);
+    expect(resolved).toBe(false);
+  });
+
+  it('--check and --force refuse too', async () => {
+    const { deps, calls } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8', upstreamUpgrade: false });
+    expect(await runUpgrade({ check: true }, deps)).toBe(1);
+    expect(await runUpgrade({ force: true, version: '0.9.9' }, deps)).toBe(1);
+    expect(calls.errors).toEqual([refusal, refusal]);
+    expect(calls.runs).toEqual([]);
+  });
+
+  it('source checkout prints the git pull instruction and succeeds', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'source', root: '/dev/codegraph-psql' },
+      currentVersion: '0.9.8',
+      upstreamUpgrade: false,
+    });
+    expect(await runUpgrade({}, deps)).toBe(0);
+    expect(calls.errors).toEqual([]);
+    expect(calls.runs).toEqual([]);
+    expect(calls.logs.map((l) => l.replace(/\x1b\[\d+m/g, ''))).toEqual([
+      'Running from a source checkout at /dev/codegraph-psql.',
+      'Upgrade it with: git pull && npm run build',
+    ]);
   });
 });
 

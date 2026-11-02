@@ -230,7 +230,8 @@ export class Telemetry {
 
   /**
    * Resolution order (first match wins) — keep in sync with TELEMETRY.md:
-   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > stored config > default on.
+   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > stored config > default off.
+   * The fork defaults to off: its events would land in upstream's telemetry.
    */
   getStatus(): TelemetryStatus {
     const config = this.readConfig();
@@ -250,7 +251,7 @@ export class Telemetry {
       if (!config.enabled) this.clearPending();
       return { enabled: config.enabled, decidedBy: 'config', machineId, configPath: this.configPath };
     }
-    return { enabled: true, decidedBy: 'default', machineId, configPath: this.configPath };
+    return { enabled: false, decidedBy: 'default', machineId, configPath: this.configPath };
   }
 
   isEnabled(): boolean {

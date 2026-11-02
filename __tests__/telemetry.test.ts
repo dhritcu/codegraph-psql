@@ -29,12 +29,13 @@ describe('Telemetry', () => {
   let stderrLines: string[];
   let nowValue: Date;
 
+  // Telemetry is off by default in this fork, so the send-path suites opt in.
   const make = (overrides: Partial<ConstructorParameters<typeof Telemetry>[0]> = {}) =>
     new Telemetry({
       dir,
       fetchImpl: mockFetch(calls),
       now: () => nowValue,
-      env: {},
+      env: { CODEGRAPH_TELEMETRY: '1' },
       stderr: (line) => stderrLines.push(line),
       installExitHook: false,
       ...overrides,
@@ -52,9 +53,16 @@ describe('Telemetry', () => {
   });
 
   describe('consent precedence', () => {
-    it('defaults to enabled when nothing decides otherwise', () => {
-      const t = make();
-      expect(t.getStatus()).toMatchObject({ enabled: true, decidedBy: 'default', machineId: null });
+    it('defaults to disabled when nothing decides otherwise', async () => {
+      const fetchSpy = mockFetch(calls);
+      const t = make({ env: {}, fetchImpl: fetchSpy });
+      expect(t.getStatus()).toEqual({ enabled: false, decidedBy: 'default', machineId: null, configPath: t.configPath });
+      t.recordLifecycle('index', { languages: ['go'] });
+      t.persistSync();
+      await t.flushNow();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(fs.existsSync(t.queuePath)).toBe(false);
+      expect(stderrLines).toEqual([]);
     });
 
     it('DO_NOT_TRACK beats everything, including a forced-on env and config', () => {
@@ -74,7 +82,7 @@ describe('Telemetry', () => {
     });
 
     it('stored config decides when no env is set', () => {
-      const t = make();
+      const t = make({ env: {} });
       t.setEnabled(false, 'installer');
       expect(t.getStatus()).toMatchObject({ enabled: false, decidedBy: 'config' });
     });

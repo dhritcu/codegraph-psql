@@ -17,7 +17,6 @@ import * as os from 'os';
 
 /** JSON waitlist endpoint on the landing page (see its /api/waitlist route). */
 export const BETA_SIGNUP_ENDPOINT = 'https://getcodegraph.com/api/waitlist';
-export const BETA_SIGNUP_URL = 'https://getcodegraph.com';
 
 /** Same shape the landing-page form validates against. */
 export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -107,63 +106,9 @@ export function shouldOfferBetaSignup(deps: BetaSignupDeps = {}): boolean {
   return !hasBetaSignupChoice(deps);
 }
 
-// Dynamic import helper — tsc compiles import() to require() in CJS mode,
-// which fails for ESM-only packages (same trick as installer/index.ts).
-// eslint-disable-next-line @typescript-eslint/no-implied-eval
-const importESM = new Function('specifier', 'return import(specifier)') as
-  (specifier: string) => Promise<typeof import('@clack/prompts')>;
-
 /**
- * The full interactive offer: confirm → email → submit → remember. Shared by
- * `codegraph install` (end of a successful install) and `codegraph upgrade`
- * (after a successful binary update). Silently does nothing when the gate
- * says no; never throws — a marketing question must not fail the command
- * that hosts it. Cancel (Ctrl-C) and a failed submit store nothing, so a
- * later install/upgrade may offer again; an explicit yes or no is stored
- * forever.
+ * The fork never offers the waitlist: it feeds upstream's CodeGraph Pro list,
+ * which a fork user did not sign up for. Kept as a no-op so the install and
+ * upgrade call sites stay identical to upstream.
  */
-export async function maybeOfferBetaSignup(deps: BetaSignupDeps = {}): Promise<void> {
-  try {
-    if (!shouldOfferBetaSignup(deps)) return;
-    const clack = await importESM('@clack/prompts');
-
-    const wantsBeta = await clack.confirm({
-      message:
-        'Want early access to CodeGraph Pro? Join the beta waitlist — we’ll only email you about CodeGraph, never share your address.',
-      initialValue: true,
-    });
-    if (clack.isCancel(wantsBeta)) {
-      clack.log.info(`Skipped — you can join anytime at ${BETA_SIGNUP_URL}.`);
-      return;
-    }
-    if (!wantsBeta) {
-      recordBetaSignupChoice(false, deps);
-      clack.log.info(`No problem — you can join anytime at ${BETA_SIGNUP_URL}.`);
-      return;
-    }
-
-    const email = await clack.text({
-      message: 'What email should we send beta access to?',
-      placeholder: 'you@company.com',
-      validate: (value) =>
-        EMAIL_RE.test((value ?? '').trim()) ? undefined : 'That email address doesn’t look right.',
-    });
-    if (clack.isCancel(email)) {
-      clack.log.info(`Skipped — you can join anytime at ${BETA_SIGNUP_URL}.`);
-      return;
-    }
-
-    const s = clack.spinner();
-    s.start('Joining the beta waitlist...');
-    const ok = await submitBetaSignup(email.trim(), deps);
-    if (ok) {
-      s.stop('You’re on the list — we’ll email you when beta access opens.');
-      recordBetaSignupChoice(true, deps);
-    } else {
-      s.stop('Couldn’t reach the waitlist right now.');
-      clack.log.warn(`No worries — you can join anytime at ${BETA_SIGNUP_URL}.`);
-    }
-  } catch {
-    /* never let the beta question break an install or upgrade */
-  }
-}
+export async function maybeOfferBetaSignup(_deps: BetaSignupDeps = {}): Promise<void> {}

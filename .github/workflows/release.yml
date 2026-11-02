@@ -29,6 +29,8 @@ permissions:
   attestations: write  # store the GitHub artifact attestations for the bundles
 
 jobs:
+  # Every job is gated to upstream: a fork has neither its RELEASE_PAT nor npm's
+  # trusted publisher, and must never publish under @colbymchenry/codegraph.
   # Native extraction-kernel prebuilds (docs/design/rust-kernel-migration-plan.md).
   # As of 1.5.0 the kernel is the release's HEADLINE, not an optional extra, so
   # this matrix is REQUIRED: a failed kernel build blocks the release instead of
@@ -40,6 +42,7 @@ jobs:
   # ship one). (Runner images ship rustup; build-kernel.sh
   # adds each cross target itself.)
   kernel:
+    if: github.repository == 'colbymchenry/codegraph'
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +72,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.repository == 'colbymchenry/codegraph'
     runs-on: ubuntu-latest
     needs: kernel
     steps:
