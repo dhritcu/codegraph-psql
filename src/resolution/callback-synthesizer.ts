@@ -5319,7 +5319,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
   if (/\.go$/.test(filePath)) return true;
-  if (/\.(?:sql|psql|pgsql)$/i.test(filePath) && /\b(?:trigger|insert|update|delete|merge)\b/i.test(content)) return true;
+  if (/\.(?:sql|psql|pgsql)$/i.test(filePath) && /\b(?:trigger|insert|update|delete|merge|drop)\b/i.test(content)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content) || hasTauriPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
