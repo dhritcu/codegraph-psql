@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import type CodeGraph from '../index';
 import type { Edge, Node } from '../types';
 import { foldObjectName, qualify, splitIdentifierPath } from '../extraction/languages/postgres-names';
+import { codeOnly, IDENT } from '../resolution/frameworks/postgres';
 
 const SQL_LANGUAGES: ReadonlySet<string> = new Set(['postgres', 'plpgsql']);
 const SQL_OPS: ReadonlySet<string> = new Set(['select', 'insert', 'update', 'delete', 'merge']);
@@ -192,59 +193,13 @@ export interface SqlDrop {
 }
 
 const SQL_FILE = /\.(?:sql|psql|pgsql)$/i;
-const IDENT = String.raw`(?:"(?:[^"]|"")*"|[A-Za-z_][\w$]*)`;
 const DROP_STATEMENT =
   /\bdrop\s+(trigger|table|view|materialized\s+view|function|procedure|routine)\s+(?:if\s+exists\s+)?([^;]*)/gi;
 const DROPPED_TRIGGER = new RegExp(String.raw`^(${IDENT})\s+ON\s+(${IDENT}(?:\s*\.\s*${IDENT}){0,2})`, 'i');
 
-/**
- * `text` with comments, string literals and routine bodies blanked, offsets
- * and newlines kept. A DO block's body stays, since it runs as the migration
- * applies.
- */
-function ddlOnly(text: string): string {
-  let out = '';
-  let copied = 0;
-  let doClose: string | null = null;
-  let i = 0;
-  while (i < text.length) {
-    const ch = text[i]!;
-    let end = -1;
-    if (ch === '-' && text[i + 1] === '-') {
-      end = text.indexOf('\n', i);
-      if (end < 0) end = text.length;
-    } else if (ch === '/' && text[i + 1] === '*') {
-      end = text.indexOf('*/', i + 2);
-      end = end < 0 ? text.length : end + 2;
-    } else if (ch === "'") {
-      end = i + 1;
-      while (end < text.length && !(text[end] === "'" && text[end + 1] !== "'")) end += text[end] === "'" ? 2 : 1;
-      end = Math.min(end + 1, text.length);
-    } else if (ch === '$') {
-      const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i, i + 64))?.[0];
-      if (tag && (tag === doClose || (!doClose && /\bdo\s*$/i.test(text.slice(Math.max(0, i - 16), i))))) {
-        doClose = tag === doClose ? null : tag;
-        i += tag.length;
-        continue;
-      }
-      if (tag) {
-        const close = text.indexOf(tag, i + tag.length);
-        end = close < 0 ? text.length : close + tag.length;
-      }
-    }
-    if (end > i) {
-      out += text.slice(copied, i) + text.slice(i, end).replace(/[^\n]/g, ' ');
-      copied = i = end;
-    } else {
-      i++;
-    }
-  }
-  return out + text.slice(copied);
-}
-
 function dropsIn(file: string, text: string): SqlDrop[] {
   if (!/\bdrop\s/i.test(text)) return [];
-  const code = ddlOnly(text);
+  const code = codeOnly(text, true);
   const out: SqlDrop[] = [];
   let line = 1;
   let counted = 0;
