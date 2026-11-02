@@ -25,8 +25,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          # Not 22.12: node:sqlite is unflagged from 22.13, and every DB test needs it.
-          node-version: '22.13'
+          # Not 22.12 or 22.13: node:sqlite is unflagged from 22.13, but that build's
+          # SQLite has no FTS5 ("no such module: fts5"), which every DB test needs.
+          node-version: '22.23'
           cache: npm
       - run: npm ci
       - run: npm run build

@@ -11,7 +11,7 @@ The fork differs from upstream in four ways that keep it from touching upstream'
 
 ## Install
 
-The only install channel is a source checkout linked onto your `PATH`. It needs Node 22.13 or newer.
+The only install channel is a source checkout linked onto your `PATH`. It needs Node 24, or Node 22.23 or newer, which CI runs. Node 22.13's built-in SQLite has no FTS5, so the index cannot be built on it.
 
 ```bash
 git clone git@github.com:dhritcu/codegraph-psql.git
