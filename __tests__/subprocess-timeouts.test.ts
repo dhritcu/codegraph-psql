@@ -51,13 +51,11 @@ describe('git subprocess calls pass a timeout (#1139)', () => {
 
 describe('no exec*Sync call site in these modules is unbounded (#1139)', () => {
   // Source-level sweep: behavior tests above can only reach exported
-  // functions; this also covers the non-exported `gitHooksDir` and the
-  // installer's `npm install -g` (buried in an interactive prompt flow),
-  // and catches future call sites added to these files without a timeout.
+  // functions; this also covers the non-exported `gitHooksDir`, and
+  // catches future call sites added to these files without a timeout.
   it.each([
     'src/sync/worktree.ts',
     'src/sync/git-hooks.ts',
-    'src/installer/index.ts',
   ])('%s passes a timeout at every exec*Sync call site', (rel) => {
     const src = fs.readFileSync(path.resolve(__dirname, '..', rel), 'utf8');
     const sites = src.split(/\bexec(?:File)?Sync\(/).slice(1);

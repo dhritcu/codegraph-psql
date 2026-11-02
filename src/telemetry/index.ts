@@ -30,7 +30,7 @@ import * as os from 'os';
 const randomUUID = (): string => (require('crypto') as typeof import('crypto')).randomUUID();
 
 export const TELEMETRY_ENDPOINT = 'https://telemetry.getcodegraph.com/v1/events';
-export const TELEMETRY_DOCS = 'https://github.com/colbymchenry/codegraph/blob/main/TELEMETRY.md';
+export const TELEMETRY_DOCS = 'https://github.com/dhritcu/codegraph-psql/blob/main/TELEMETRY.md';
 
 // v2: dropped the `sqlite_backend` field from the `index` event — node:sqlite is
 // now the only backend (the better-sqlite3-native / wasm-fallback split is gone),
@@ -230,7 +230,8 @@ export class Telemetry {
 
   /**
    * Resolution order (first match wins) — keep in sync with TELEMETRY.md:
-   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > stored config > default on.
+   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > stored config > default off.
+   * The fork defaults to off: its events would land in upstream's telemetry.
    */
   getStatus(): TelemetryStatus {
     const config = this.readConfig();
@@ -250,7 +251,7 @@ export class Telemetry {
       if (!config.enabled) this.clearPending();
       return { enabled: config.enabled, decidedBy: 'config', machineId, configPath: this.configPath };
     }
-    return { enabled: true, decidedBy: 'default', machineId, configPath: this.configPath };
+    return { enabled: false, decidedBy: 'default', machineId, configPath: this.configPath };
   }
 
   isEnabled(): boolean {

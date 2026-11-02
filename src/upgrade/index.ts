@@ -392,6 +392,12 @@ export interface UpgradeDeps {
    * embedded callers stay prompt-free; never fatal to the upgrade.
    */
   offerBetaSignup?: () => Promise<void>;
+  /**
+   * Run upstream's per-method upgrade instead of the fork guard. Only
+   * upstream's own upgrade tests set it, so they keep covering the code a
+   * fork sync merges.
+   */
+  upstreamUpgrade?: boolean;
 }
 
 // Colors off when piped / NO_COLOR / --no-color (#1281).
@@ -419,6 +425,20 @@ export function reindexAdvisory(): string {
  */
 export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promise<number> {
   const { currentVersion, method } = deps;
+
+  // Every channel but a source checkout installs upstream's release over the fork.
+  if (!deps.upstreamUpgrade) {
+    if (method.kind === 'source') {
+      deps.warn(`Running from a source checkout at ${method.root}.`);
+      deps.log(c.dim('Upgrade it with: git pull && npm ci && npm run build'));
+      return 0;
+    }
+    deps.error(
+      'This is the codegraph-psql fork. `codegraph upgrade` would replace it with upstream CodeGraph, so it is disabled.',
+    );
+    deps.log(c.dim('Update the fork from its source checkout: git pull && npm ci && npm run build (see FORK.md).'));
+    return 1;
+  }
 
   // Resolve the target version (pinned or latest).
   let latest: string;

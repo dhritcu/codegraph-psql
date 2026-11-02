@@ -17,6 +17,7 @@ import {
   BETA_SIGNUP_ENDPOINT,
   EMAIL_RE,
   hasBetaSignupChoice,
+  maybeOfferBetaSignup,
   recordBetaSignupChoice,
   shouldOfferBetaSignup,
   submitBetaSignup,
@@ -97,6 +98,31 @@ describe('shouldOfferBetaSignup — the shared no-spam gate', () => {
   it('never offers without a terminal (scripts, CI, piped output)', () => {
     expect(shouldOfferBetaSignup({ dir, stdinIsTTY: false, stdoutIsTTY: true })).toBe(false);
     expect(shouldOfferBetaSignup({ dir, stdinIsTTY: true, stdoutIsTTY: false })).toBe(false);
+  });
+});
+
+describe('maybeOfferBetaSignup', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-beta-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('never prompts, posts, or records on a fresh machine with a real terminal', async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: unknown) => {
+      urls.push(String(url));
+      return new Response('{"ok":true}', { status: 200 });
+    }) as typeof fetch;
+
+    await maybeOfferBetaSignup({ dir, fetchImpl, stdinIsTTY: true, stdoutIsTTY: true });
+
+    expect(urls).toEqual([]);
+    expect(fs.readdirSync(dir)).toEqual([]);
   });
 });
 

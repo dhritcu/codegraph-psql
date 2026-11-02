@@ -15,7 +15,6 @@
  * `--print-config` CLI flags.
  */
 
-import { execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
@@ -104,32 +103,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     return;
   }
 
-  // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present).
+  // Step 2: the CLI on PATH. The fork's only install channel is `npm link` from
+  // its checkout; `npm install -g` would put upstream's release on PATH instead.
   if (!useDefaults) {
-    const shouldInstallGlobally = await clack.confirm({
-      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
-      initialValue: true,
-    });
-    if (clack.isCancel(shouldInstallGlobally)) {
-      clack.cancel('Installation cancelled.');
-      process.exit(0);
-    }
-    if (shouldInstallGlobally) {
-      const s = clack.spinner();
-      s.start('Installing codegraph CLI...');
-      try {
-        // Generous bound (slow networks / cold npm cache) — but bounded, so a
-        // wedged npm can't hang the interactive installer forever (#1139).
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true, timeout: 120_000 });
-        s.stop('Installed codegraph CLI on PATH');
-      } catch {
-        s.stop('Could not install (permission denied)');
-        clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
-      }
-    } else {
-      clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
-    }
+    clack.log.info('Agents launch the MCP server through `codegraph` on your PATH. Put the fork there by running `npm link` in your codegraph-psql checkout (see FORK.md).');
   }
 
   // Step 3: where the per-agent config files should land.
@@ -185,14 +162,14 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     autoAllow = false;
   }
 
-  // Step 4½: anonymous usage telemetry — a visible default-on toggle, asked
+  // Step 4½: anonymous usage telemetry — a visible default-off toggle, asked
   // exactly once. Skipped when an env var (DO_NOT_TRACK / CODEGRAPH_TELEMETRY)
   // already decides, or when a previous run stored a choice — re-runs and
   // upgrades never re-ask.
   if (!useDefaults && getTelemetry().getStatus().decidedBy === 'default' && !getTelemetry().hasStoredChoice()) {
     const share = await clack.confirm({
       message: 'Share anonymous usage stats? (No code, paths, or names — see TELEMETRY.md)',
-      initialValue: true,
+      initialValue: false,
     });
     if (clack.isCancel(share)) {
       // Don't kill the install over the telemetry question — leave it
