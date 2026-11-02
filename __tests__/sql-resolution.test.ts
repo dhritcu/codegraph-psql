@@ -112,6 +112,23 @@ describe('PostgreSQL name resolution', () => {
     }
   });
 
+  it('counts a DROP a DO block runs as the migration applies, and not one in a routine body', async () => {
+    const cg = await indexed({
+      'drizzle/0000_init.sql': 'CREATE TABLE legacy (id int);\nCREATE TABLE kept (id int);\n',
+      'drizzle/0001_drop.sql':
+        'DO $$\nBEGIN\n  IF true THEN\n    DROP TABLE legacy;\n  END IF;\nEND;\n$$;\n' +
+        'CREATE FUNCTION purge() RETURNS void LANGUAGE plpgsql AS $f$\nBEGIN\n  DROP TABLE kept;\nEND;\n$f$;\n',
+      'drizzle/0002_after.sql': 'CREATE VIEW after_drop AS SELECT legacy.id FROM legacy, kept;\n',
+    });
+    try {
+      expect(edges(cg)).toEqual([
+        'public::after_drop@drizzle/0002_after.sql:1 -references-> public::kept@drizzle/0000_init.sql:2',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('gives a call to a built-in function no edge, even when the project declares one of that name', async () => {
     const cg = await indexed({
       'schema.sql': 'CREATE TABLE t (id int);\n' + fn('stamp', 'NEW.at := now(); PERFORM count(*) FROM t;') +
