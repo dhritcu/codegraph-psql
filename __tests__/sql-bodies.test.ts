@@ -241,12 +241,13 @@ describe('indexing the shop schema bodies', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('connects create_order to the orders table it inserts into and the function it calls', async () => {
+  it('connects create_order to the orders table it inserts into, the function it calls, and the trigger its insert fires', async () => {
     const cg = await CodeGraph.init(dir, { silent: true });
     try {
       await cg.indexAll();
       const createOrder = cg.searchNodes('create_order').map((r) => r.node).find((n) => n.qualifiedName === 'app::create_order')!;
       expect(cg.getCallees(createOrder.id).map((c) => `${c.edge.kind} ${c.node.qualifiedName} :${c.edge.line}`).sort()).toEqual([
+        'calls app::log_order_insert :23',
         'calls public::customer_total :25',
         'references public::orders :23',
       ]);

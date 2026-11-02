@@ -285,12 +285,13 @@ describe('PostgreSQL trigger edges', () => {
     }
   });
 
-  it('links the fixture procedure that updates orders to the trigger function touching it', async () => {
+  it('links the fixture writers of orders to the trigger functions their writes fire', async () => {
     fs.cpSync(path.join(__dirname, 'fixtures', 'postgres'), dir, { recursive: true });
     const cg = await indexed({});
     try {
       expect(triggerEdges(cg)).toEqual([
         'app::cancel_order -> public::touch_updated_at [before update row] public::orders::orders_touch @migrations/002_functions.sql:9',
+        'app::create_order -> app::log_order_insert [after insert row] public::orders::orders_audit @migrations/004_audit.sql:16',
       ]);
     } finally {
       cg.destroy();
