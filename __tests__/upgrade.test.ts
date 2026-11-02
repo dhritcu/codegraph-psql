@@ -705,7 +705,7 @@ describe('runUpgrade fork guard', () => {
     expect(calls.runs).toEqual([]);
     expect(calls.logs.map((l) => l.replace(/\x1b\[\d+m/g, ''))).toEqual([
       'Running from a source checkout at /dev/codegraph-psql.',
-      'Upgrade it with: git pull && npm run build',
+      'Upgrade it with: git pull && npm ci && npm run build',
     ]);
   });
 });

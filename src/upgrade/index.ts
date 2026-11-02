@@ -430,7 +430,7 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   if (!deps.upstreamUpgrade) {
     if (method.kind === 'source') {
       deps.warn(`Running from a source checkout at ${method.root}.`);
-      deps.log(c.dim('Upgrade it with: git pull && npm run build'));
+      deps.log(c.dim('Upgrade it with: git pull && npm ci && npm run build'));
       return 0;
     }
     deps.error(

@@ -21,7 +21,7 @@ npm run build
 npm link
 ```
 
-`npm link` puts `codegraph` in npm's global bin folder. An upstream `codegraph` that sits earlier on your `PATH` shadows it. That includes the `install.sh` bundle and an `npm i -g @colbymchenry/codegraph`. Check which one runs:
+`npm link` puts `codegraph` in npm's global bin folder. Run it yourself: `codegraph install` only wires agent configs and never runs `npm install -g`, since that would put upstream's release on your `PATH` in place of the fork. An upstream `codegraph` that sits earlier on your `PATH` shadows it. That includes the `install.sh` bundle and an `npm i -g @colbymchenry/codegraph`. Check which one runs:
 
 ```bash
 which -a codegraph
@@ -66,10 +66,11 @@ The fork keeps merges cheap by staying out of upstream's code.
 These upstream files carry fork edits and are where sync conflicts appear:
 
 - `package.json` holds `private` and the `prepublishOnly` guard.
-- `src/telemetry/index.ts` holds the off-by-default consent rule.
+- `src/telemetry/index.ts` holds the off-by-default consent rule and links the fork's `TELEMETRY.md`.
 - `src/installer/beta-signup.ts` holds the no-op waitlist offer.
+- `src/installer/index.ts` points at `npm link` instead of running `npm install -g`, and its telemetry prompt defaults to No.
 - `src/upgrade/index.ts` holds the upgrade refusal.
 - `.github/workflows/release.yml` holds the repository gate on each job.
-- `__tests__/telemetry.test.ts`, `__tests__/upgrade.test.ts`, `__tests__/beta-signup.test.ts` and `__tests__/installer-targets.test.ts` cover the above.
+- `__tests__/telemetry.test.ts`, `__tests__/upgrade.test.ts`, `__tests__/beta-signup.test.ts`, `__tests__/installer-targets.test.ts` and `__tests__/installer-interactive.test.ts` cover the above.
 
 CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run build` and `npm test` on macOS and Linux for every pull request and every push to `main`.

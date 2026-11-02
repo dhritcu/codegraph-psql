@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           # Not 22.12: node:sqlite is unflagged from 22.13, and every DB test needs it.
-          node-version: 22
+          node-version: '22.13'
           cache: npm
       - run: npm ci
       - run: npm run build

@@ -1,5 +1,7 @@
 # Telemetry
 
+> **codegraph-psql fork:** telemetry is off by default. Nothing is sent unless you run `codegraph telemetry on`, set `CODEGRAPH_TELEMETRY=1`, or answer Yes to the installer's prompt, whose default is No.
+
 CodeGraph collects a small set of **anonymous usage statistics** — which commands and
 tools get used, which languages get indexed, which agents drive usage — so we can tell
 which of the 20+ languages and 8 agent integrations deserve the most work. This page is
