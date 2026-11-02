@@ -45,6 +45,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { hasTauriPattern, tauriEdges } from './tauri-synthesizer';
 import { pgTriggerEdges } from './pg-trigger-synthesizer';
 import { hasSqlClientPattern, sqlClientEdges } from './sql-client-synthesizer';
+import { embeddedSqlEdges, hasEmbeddedSqlPattern } from './embedded-sql-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
@@ -5322,6 +5323,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\.go$/.test(filePath)) return true;
   if (/\.(?:sql|psql|pgsql)$/i.test(filePath) && /\b(?:trigger|insert|update|delete|merge|drop)\b/i.test(content)) return true;
   if (hasSqlClientPattern(filePath, content)) return true;
+  if (hasEmbeddedSqlPattern(filePath, content)) return true;
   if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content) || hasTauriPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
@@ -5443,6 +5445,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'pgTriggerEdges', gate: (has) => has('postgres'), run: (q, c, y) => pgTriggerEdges(q, c, y) },
   { name: 'sqlClientEdges', gate: (has) => has('postgres') && has(...JS_FAMILY), run: (q, c, y) => sqlClientEdges(q, c, y) },
+  { name: 'embeddedSqlEdges', gate: (has) => has('postgres') && has(...JS_FAMILY), run: (q, c, y) => embeddedSqlEdges(q, c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
 ];
 
