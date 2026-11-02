@@ -193,6 +193,40 @@ describe('PostgreSQL trigger edges', () => {
     }
   });
 
+  it.each([
+    ['DROP FUNCTION', 'DROP FUNCTION on_insert() CASCADE;\n'],
+    ['DROP TABLE', 'DROP TABLE orders CASCADE;\n'],
+  ])('removes a trigger\'s edges when a sync adds a migration whose only statement is %s', async (_label, drop) => {
+    const files = {
+      'migrations/001_schema.sql': TABLE + triggerFn('on_insert') +
+        'CREATE TRIGGER orders_insert AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION on_insert();\n',
+      'migrations/002_writers.sql': writers,
+    };
+    const cg = await indexed(files);
+    const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sql-triggers-fresh-'));
+    try {
+      expect(triggerEdges(cg)).toEqual([
+        'public::add_order -> public::on_insert [after insert row] public::orders::orders_insert @migrations/001_schema.sql:7',
+      ]);
+      write({ 'migrations/003_drop.sql': drop });
+      await cg.sync();
+      expect(triggerEdges(cg)).toEqual([]);
+
+      const synced = dir;
+      dir = freshDir;
+      const fresh = await indexed({ ...files, 'migrations/003_drop.sql': drop });
+      dir = synced;
+      try {
+        expect(triggerEdges(fresh)).toEqual([]);
+      } finally {
+        fresh.destroy();
+      }
+    } finally {
+      cg.destroy();
+      fs.rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
   it('links the fixture procedure that updates orders to the trigger function touching it', async () => {
     fs.cpSync(path.join(__dirname, 'fixtures', 'postgres'), dir, { recursive: true });
     const cg = await indexed({});
