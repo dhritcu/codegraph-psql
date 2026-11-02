@@ -12,13 +12,51 @@
  * rows become spaces, and an interpolation loses only its colon, which
  * leaves `'name'` as a string literal and `"name"` or `name` as an
  * identifier: the same token class psql substitutes there.
+ *
+ * A file in another dialect (a MySQL dump, a SQLite or D1 schema) carries
+ * syntax Postgres never accepts. In such a file the statements the grammar
+ * cannot read become spaces too, so it indexes what Postgres also reads
+ * without a parse warning; a file with no such marker keeps its errors.
  */
+
+import { getParser } from '../grammars';
 
 const QUICK_CHECK = /\\|(?<!:):(?![:=])["'A-Za-z_]|\bstdin\b/i;
 const COPY_FROM_STDIN = /\bCOPY\b[\s\S]*\bFROM\s+STDIN\b/i;
 const DOLLAR_TAG = /^\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$/;
 
 export function preParsePostgres(source: string): string {
+  return blankForeignStatements(preParsePsql(source));
+}
+
+/** Syntax of MySQL or SQLite that no Postgres statement contains outside a literal or comment. */
+const FOREIGN_DIALECT = /`|\bAUTO_?INCREMENT\b|\bENGINE\s*=|\bWITHOUT\s+ROWID\b|^\s*PRAGMA\b/im;
+const LITERAL_OR_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$([A-Za-z_]\w*)?\$[\s\S]*?\$\1\$/g;
+
+function blankForeignStatements(source: string): string {
+  if (!FOREIGN_DIALECT.test(source) || !FOREIGN_DIALECT.test(source.replace(LITERAL_OR_COMMENT, ' '))) return source;
+  const parser = getParser('postgres');
+  if (!parser) return source;
+  const out = source.split('');
+  let start = 0;
+  const check = (end: number): void => {
+    const tree = parser.parse(source.slice(start, end));
+    for (const c of tree?.rootNode.hasError ? tree.rootNode.children : []) {
+      if (!c || (!c.hasError && c.type !== 'ERROR')) continue;
+      for (let k = start + c.startIndex; k < start + c.endIndex; k++) if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
+    }
+    tree?.delete();
+    start = end;
+  };
+  const token = new RegExp(`${LITERAL_OR_COMMENT.source}|;`, 'g');
+  for (let m = token.exec(source); m; m = token.exec(source)) {
+    if (m[0] === ';') check(m.index + 1);
+  }
+  check(source.length);
+  return out.join('');
+}
+
+function preParsePsql(source: string): string {
   if (!QUICK_CHECK.test(source)) return source;
 
   const out = source.split('');
