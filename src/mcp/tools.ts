@@ -57,6 +57,8 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
+import { crossFileSqlMembers, dropSite, droppedSqlObjects, isSqlNode, liveSqlDefinitions, sqlCallerRows, sqlDroppedAt, sqlEdgeOps, sqlObjectsNamed, sqlOpTags, sqlTableSummary, writePathTables } from '../graph/sql-surface';
+import { describeTableAccess } from '../graph/sql-flow';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
@@ -3431,7 +3433,7 @@ export class ToolHandler {
       const sites = new Map<string, Edge[]>();
       const recursive = new Set<string>();
       for (const node of defNodes) {
-        for (const c of cg.getCallSites(node.id, 'callers')) {
+        for (const c of sqlCallerRows(cg, node, cg.getCallSites(node.id, 'callers'))) {
           const known = sites.get(c.node.id);
           if (known) {
             known.push(...c.edges);
@@ -3441,7 +3443,7 @@ export class ToolHandler {
           if (c.recursive) recursive.add(c.node.id);
           callers.push(c.node);
           answerPaths.add(c.node.filePath);
-          const label = this.edgeLabel(c.edges[0]!);
+          const label = sqlEdgeOps(c.edges).join(', ') || this.edgeLabel(c.edges[0]!);
           if (label) labels.set(c.node.id, label);
         }
       }
@@ -3526,7 +3528,7 @@ export class ToolHandler {
             if (c.recursive) recursive.add(c.node.id);
             callees.push(c.node);
             answerPaths.add(c.node.filePath);
-            const label = this.edgeLabel(c.edges[0]!);
+            const label = sqlEdgeOps(c.edges).join(', ') || this.edgeLabel(c.edges[0]!);
             if (label) labels.set(c.node.id, label);
           }
         }
@@ -3929,7 +3931,8 @@ export class ToolHandler {
           const step = best![i]!;
           if (step.edge) {
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${this.synthEdgeNote(step.edge) ?? step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            const label = this.synthEdgeNote(step.edge) ?? describeTableAccess(step.edge, step.node) ?? step.edge.kind;
+            out.push(`   ↓ ${label}${when ? ` (when ${when})` : ''}`);
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
@@ -4197,7 +4200,7 @@ export class ToolHandler {
     const entries: string[] = [];
     for (const root of roots) {
       let callers: Array<{ node: Node }> = [];
-      try { callers = cg.getCallers(root.id) as Array<{ node: Node }>; } catch { /* skip this root */ }
+      try { callers = sqlCallerRows(cg, root, cg.getCallers(root.id)); } catch { /* skip this root */ }
 
       const seen = new Set<string>();
       const uniq: Node[] = [];
@@ -4237,6 +4240,38 @@ export class ToolHandler {
       ...entries,
       '',
     ].join('\n');
+  }
+
+  /**
+   * The write path of the SQL tables an exploration found or whose writers it
+   * found: each table's triggers with the function they run, and its writers by
+   * operation, so "what happens when X is inserted" is answered without opening
+   * the migrations. Tables the query names come first; '' when none qualify.
+   */
+  private buildSqlTablesSection(cg: CodeGraph, subgraph: Subgraph, query: string): string {
+    const MAX_TABLES = 3;
+    const found = [...subgraph.nodes.values()];
+    const named = sqlObjectsNamed(cg, query);
+    if (named.length === 0 && !found.some(isSqlNode)) return '';
+    const words = new Set(query.toLowerCase().split(/[^a-z0-9_$]+/));
+    const candidates = new Map<string, Node>();
+    const add = (n: Node) => { if (n.kind === 'class' && isSqlNode(n)) candidates.set(n.id, n); };
+    named.forEach(add);
+    named.forEach((n) => writePathTables(cg, n).forEach(add));
+    found.filter((n) => words.has(n.name.toLowerCase())).forEach(add);
+    found.forEach((n) => writePathTables(cg, n).forEach(add));
+    found.forEach(add);
+    const blocks: string[] = [];
+    for (const table of candidates.values()) {
+      if (blocks.length === MAX_TABLES) break;
+      const block = sqlTableSummary(cg, table);
+      if (block && block.includes('\n')) blocks.push(block);
+    }
+    // A routine or trigger the query names that a later migration dropped reads
+    // as gone, never as code that still runs.
+    const dropped = droppedSqlObjects(cg, [...named, ...found.filter((n) => words.has(n.name.toLowerCase()))]);
+    if (dropped.length > 0) blocks.push(`**Dropped by later migrations:** ${dropped.join(', ')}`);
+    return blocks.length > 0 ? `${blocks.join('\n\n')}\n` : '';
   }
 
   /**
@@ -5462,6 +5497,9 @@ export class ToolHandler {
     // knows what to update/verify before editing without a separate call.
     const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
     if (blastRadius) lines.push(blastRadius);
+
+    const sqlTables = this.buildSqlTablesSection(cg, subgraph, query);
+    if (sqlTables) lines.push(sqlTables);
 
     // Relationship map — show how symbols connect
     const significantEdges = subgraph.edges.filter(e =>
@@ -8122,6 +8160,21 @@ export class ToolHandler {
       return this.textResult(this.truncateOutput(await this.renderNodeSection(cg, matches[0]!, includeCode)));
     }
 
+    // One SQL object defined again by later migrations: the latest definition is
+    // the live one, and the earlier ones are its history.
+    const sqlLive = liveSqlDefinitions(cg, matches);
+    if (sqlLive.nodes.length === 1) {
+      const live = sqlLive.nodes[0]!;
+      const earlier = sqlLive.superseded.get(live.id) ?? [];
+      // Kept past the cut a long body takes, so the history is never what goes.
+      return this.textResult([
+        this.truncateOutput(await this.renderNodeSection(cg, live, includeCode)),
+        '',
+        `**Superseded by the definition above (${earlier.length}, latest first)**`,
+        ...earlier.map((n) => `- ${n.filePath}:${n.startLine}`),
+      ].join('\n'));
+    }
+
     // Multiple definitions share this name — overloads, or same-named methods on
     // different types (Alamofire `didCompleteTask`/`task`/`validate`, gin
     // `reset`). Returning ONE forces the agent to guess, and when it guesses
@@ -8448,7 +8501,10 @@ export class ToolHandler {
         code = await cg.getCode(node.id);
       }
     }
-    return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
+    const table = sqlTableSummary(cg, node);
+    const drop = sqlDroppedAt(cg, node);
+    const dropNote = drop ? `**Dropped:** ${dropSite(drop)}, by a later migration; it does not exist once every migration applies.` : undefined;
+    return this.formatNodeDetails(node, code, outline, dropNote) + (table ? `\n\n${table}\n` : '') + this.formatTrail(cg, node);
   }
 
   // Whole-file fallback caps for a drifted file (#1474): small enough to fit
@@ -8526,15 +8582,15 @@ export class ToolHandler {
     const TRAIL_CALL_SITES = 3;
     const fmt = (row: CallSiteRow, where: string) => {
       const base = `${row.node.name} (${where})`;
-      const synth = this.synthEdgeNote(row.edges[0]!);
-      return synth ? `${base} [${synth}]` : base;
+      const tag = this.synthEdgeNote(row.edges[0]!) ?? (sqlEdgeOps(row.edges).join(', ') || null);
+      return tag ? `${base} [${tag}]` : base;
     };
     // A callee reads at its declaration, where following it leads. A caller
     // reads at the lines its calls sit on, every one a line to edit when this
     // symbol changes (#2909), and a symbol that calls itself is among its own
     // callers, once.
     const callees = cg.getCallSites(node.id, 'callees').filter((row) => !row.recursive);
-    const callers = cg.getCallSites(node.id, 'callers');
+    const callers = sqlCallerRows(cg, node, cg.getCallSites(node.id, 'callers'));
     if (callees.length === 0 && callers.length === 0) return '';
     const callee = (row: CallSiteRow) => fmt(row, `${row.node.filePath}:${row.node.startLine}`);
     const caller = (row: CallSiteRow) => {
@@ -9107,10 +9163,11 @@ export class ToolHandler {
       byFile.set(node.filePath, existing);
     }
 
+    const opTags = sqlOpTags(impact.edges);
     for (const [file, nodes] of byFile) {
       lines.push(`**${file}:**`);
       // Compact: inline list
-      const nodeList = nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
+      const nodeList = nodes.map(n => `${n.name}:${n.startLine}${opTags.get(n.id) ?? ''}`).join(', ');
       lines.push(nodeList);
       lines.push('');
     }
@@ -9129,24 +9186,29 @@ export class ToolHandler {
     const children = cg.getChildren(node.id)
       .filter(c => c.kind !== 'import' && c.kind !== 'export')
       .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
+    // A column or trigger a later migration adds sits in that file: say which.
+    const elsewhere = crossFileSqlMembers(cg, node);
+    children.push(...elsewhere);
     if (children.length === 0) return '';
 
     const lines = [`**Members (${children.length}):**`, ''];
     for (const c of children) {
-      const loc = c.startLine ? `:${c.startLine}` : '';
+      const file = elsewhere.includes(c) ? ` ${c.filePath}` : '';
+      const loc = c.startLine ? `${file}:${c.startLine}` : file;
       const sig = c.signature ? ` — \`${c.signature}\`` : '';
       lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
     }
     return lines.join('\n');
   }
 
-  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
+  private formatNodeDetails(node: Node, code: string | null, outline?: string | null, dropNote?: string): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `**${node.name}** (${node.kind})`,
       '',
       `**Location:** ${node.filePath}${location}`,
     ];
+    if (dropNote) lines.push(dropNote);
 
     if (node.signature) {
       lines.push(`**Signature:** \`${node.signature}\``);

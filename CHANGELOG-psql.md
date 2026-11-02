@@ -8,6 +8,9 @@ Changes in the codegraph-psql fork. Upstream's changes are in `CHANGELOG.md`.
 
 - The fork installs from a source checkout with `npm link`, and `FORK.md` explains setup, updating, and syncing with upstream.
 - Every pull request now runs the build and the full test suite on macOS and Linux.
+- `codegraph_explore` follows a SQL write through the table it touches into the trigger it fires, and a flow can end at a table you name, with the operation (`insert into orders`) and the trigger's timing and event on each hop.
+- `codegraph node`, `codegraph callers` and `codegraph impact` name what each function does to a table (`[insert]`), list columns and triggers that later migrations add as members of their table, and show only the live definition of a view or function that migrations redefine.
+- The viewer colors SQL keywords and names a missing table without an internal operation prefix.
 
 ### Fixes
 

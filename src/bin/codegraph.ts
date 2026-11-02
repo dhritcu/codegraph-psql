@@ -71,6 +71,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
+import { sqlCallerRows, sqlEdgeOp, sqlEdgeOps, sqlOpTags } from '../graph/sql-surface';
 import { goPackageReaderFor } from '../graph/go-package';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import { buildTypeHierarchy, canHaveHierarchy, MAX_DESCENDANTS, MAX_DESCENDANT_DEPTH } from '../graph/type-hierarchy';
@@ -2554,7 +2555,8 @@ for (const direction of ['callers', 'callees'] as const) {
             const edges = new Map<string, Edge>();
             const recursive = new Set<string>();
             for (const target of group) {
-              for (const row of cg.getCallSites(target.id, direction)) {
+              const rows = cg.getCallSites(target.id, direction);
+              for (const row of direction === 'callers' ? sqlCallerRows(cg, target, rows) : rows) {
                 nodes.set(row.node.id, row.node);
                 if (row.recursive) recursive.add(row.node.id);
                 for (const edge of row.edges) {
@@ -2578,6 +2580,8 @@ for (const direction of ['callers', 'callees'] as const) {
           const row = (node: Node, edges: Edge[], recursive: boolean) => ({
             ...cliNode(node),
             relationships: relationships(node, edges),
+            // What a SQL caller does to a table: `["insert"]`. Absent for any other edge.
+            ...(sqlEdgeOps(ownEdges(node, edges)).length > 0 ? { ops: sqlEdgeOps(ownEdges(node, edges)) } : {}),
             lines: callSiteLines(ownEdges(node, edges)),
             recursive,
           });
@@ -2636,7 +2640,9 @@ for (const direction of ['callers', 'callees'] as const) {
                 else info(`No ${direction} found for "${symbol}"`);
               }
               for (const node of limited) {
-                const kinds = relationships(node, edges).filter((kind) => kind !== 'calls');
+                // A table access reads as its operation (`insert`), not as a bare reference.
+                const kinds = [...new Set(ownEdges(node, edges).map((edge) => sqlEdgeOp(edge) ?? edge.kind))]
+                  .filter((kind) => kind !== 'calls');
                 const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
                 const itself = recursive.has(node.id) ? ' (calls itself)' : '';
                 console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name) + chalk.dim(itself + relation));
@@ -2738,7 +2744,7 @@ program
           if (ambiguous) {
             console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${groups.length} distinct definitions (each with its own blast radius; narrow with --file):`));
           }
-          for (const { group, nodes } of collected) {
+          for (const { group, nodes, edges } of collected) {
             if (ambiguous) {
               console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} — ${nodes.size} affected symbols:\n`));
             } else {
@@ -2751,11 +2757,12 @@ program
               list.push(node);
               byFile.set(node.filePath, list);
             }
+            const opTags = sqlOpTags(edges.values());
             for (const [file, affected] of byFile) {
               console.log(chalk.cyan(file));
               for (const node of affected) {
                 const loc = node.startLine ? `:${node.startLine}` : '';
-                console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
+                console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc + (opTags.get(node.id) ?? ''))}`);
               }
               console.log();
             }

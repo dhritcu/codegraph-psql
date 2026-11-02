@@ -23,6 +23,7 @@
 import type { CodeGraph } from '../../index';
 import type { Edge, Node, NodeKind } from '../../types';
 import { isTestFile } from '../../search/query-utils';
+import { referenceDisplayName } from '../../graph/sql-surface';
 import { buildHierarchy, type WireOverride } from './hierarchy';
 import { notFound } from './respond';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
@@ -429,7 +430,7 @@ function summarizeOutsideIndex(
     .sort((a, b) => a.line - b.line || a.column - b.column)
     .slice(0, MAX_OUTSIDE_INDEX_SAMPLES)
     .map((ref) => ({
-      name: ref.referenceName,
+      name: referenceDisplayName(ref.referenceName, ref.language),
       kind: ref.referenceKind,
       line: ref.line,
       col: ref.column,
