@@ -133,6 +133,8 @@ function blank(source: string, start: number, end: number): Overlay {
   return { start, end, text: source.slice(start, end).replace(/[^\n]/g, ' ') };
 }
 
+const STRING_OR_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'/g;
+
 /**
  * `INTO [STRICT] a, b` in a PL/pgSQL statement names variables; outside
  * `INSERT INTO` / `MERGE INTO` it is blanked.
@@ -140,7 +142,7 @@ function blank(source: string, start: number, end: number): Overlay {
 function intoTargets(source: string, start: number, end: number): Overlay[] {
   const out: Overlay[] = [];
   const re = /(\S+)(\s+)INTO\s+(?:STRICT\s+)?(?:"[^"]*"|[\w$.]+)(?:\s*,\s*(?:"[^"]*"|[\w$.]+))*/gi;
-  const text = source.slice(start, end);
+  const text = source.slice(start, end).replace(STRING_OR_COMMENT, (m) => m.replace(/[^\n]/g, ' '));
   for (let m = re.exec(text); m; m = re.exec(text)) {
     const prev = m[1]!.toLowerCase();
     if (prev === 'insert' || prev === 'merge') continue;
