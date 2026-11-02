@@ -11,20 +11,26 @@
  * migrations, a table dropped and created again. Migrations apply in path
  * order, and `history` reads the definitions and DROPs of a name in that
  * order: the latest CREATE wins; a name the last statement drops resolves
- * only for a reference written while a definition was in force. Files that
+ * only for a reference written while a definition was in force. A DROP
+ * counts where it runs as the migration applies: at the top level or in a DO
+ * block, not in a routine body, which runs only when called. Files that
  * are not migrations (one `schema.sql`, unrelated scripts) have no order, so
  * a name several of them define resolves only within the reference's own file.
  *
  * Calls to the functions every database has (`now()`, `count(*)`) and names
  * in the system schemas resolve to nothing. The operation a body reference
  * performs on its table travels to the edge as `metadata.op`.
+ *
+ * The DROPs and trigger switches this module reads (`sqlDdlEvents`) are the
+ * one model of what a migration ends; the trigger pass reads them too.
  */
 
 import type { Language, Node, NodeKind } from '../../types';
 import { splitOpReferenceName } from '../../extraction/languages/postgres-bodies';
-import { foldObjectName, qualify } from '../../extraction/languages/postgres-names';
+import { foldObjectName, qualify, splitIdentifierPath } from '../../extraction/languages/postgres-names';
 import { POSTGRES_BUILTIN_FUNCTIONS } from '../postgres-builtins';
 import type { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
+import { makeLineAt } from '../synth-utils';
 
 const SQL_LANGUAGES: readonly Language[] = ['postgres', 'plpgsql'];
 const SQL_FILE = /\.(?:sql|psql|pgsql)$/i;
@@ -61,7 +67,7 @@ const CLASS_OF_DROP: Record<string, ObjectClass> = {
 };
 
 /** Where a statement sits in the order migrations apply. */
-interface SqlPosition {
+export interface SqlPosition {
   file: string;
   line: number;
 }
@@ -74,7 +80,7 @@ interface SqlEvent {
 
 const naturalOrder = new Intl.Collator('en', { numeric: true }).compare;
 
-function comparePositions(a: SqlPosition, b: SqlPosition): number {
+export function comparePositions(a: SqlPosition, b: SqlPosition): number {
   return a.file === b.file ? a.line - b.line : naturalOrder(a.file, b.file);
 }
 
@@ -103,7 +109,7 @@ function history(events: SqlEvent[], at: SqlPosition): Node | null {
  * `prisma/migrations/20240101_init/migration.sql`), or null for a file that
  * is no migration.
  */
-function migrationSeries(filePath: string): string | null {
+export function migrationSeries(filePath: string): string | null {
   const parts = filePath.split('/');
   const numbered = parts.findIndex((p) => /^\d+(?:[_\-.]|$)/.test(p));
   if (numbered >= 0) return parts.slice(0, numbered).join('/');
@@ -111,11 +117,24 @@ function migrationSeries(filePath: string): string | null {
   return dir.some((p) => /^migrations?$/i.test(p)) ? dir.join('/') : null;
 }
 
-/** Comments, quoted strings and dollar-quoted bodies blanked, newlines kept. */
-function codeOnly(text: string): string {
+/** Where a statement's order counts: its migration series, or its own file when that is no migration. */
+export const ddlScope = (file: string): string => migrationSeries(file) ?? file;
+
+export const IDENT = String.raw`(?:"(?:[^"]|"")*"|[A-Za-z_][\w$]*)`;
+export const QUALIFIED = String.raw`${IDENT}(?:\s*\.\s*${IDENT}){0,2}`;
+
+/**
+ * `text` with comments and single-quoted strings blanked, offsets and
+ * newlines kept. With `dollarBodies`, routine bodies are blanked too, but a
+ * DO block's body stays, since it runs as the migration applies; without,
+ * the first dollar quote ends the text, as it ends the body a statement
+ * inside a routine is read from.
+ */
+export function codeOnly(text: string, dollarBodies: boolean): string {
   let out = '';
   let copied = 0;
   let i = 0;
+  let doClose: string | null = null;
   while (i < text.length) {
     const ch = text[i]!;
     let end = -1;
@@ -131,6 +150,12 @@ function codeOnly(text: string): string {
       end = Math.min(end + 1, text.length);
     } else if (ch === '$') {
       const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i, i + 64))?.[0];
+      if (tag && !dollarBodies) return out + text.slice(copied, i);
+      if (tag && (tag === doClose || (!doClose && /\bdo\s*$/i.test(text.slice(Math.max(0, i - 16), i))))) {
+        doClose = tag === doClose ? null : tag;
+        i += tag.length;
+        continue;
+      }
       if (tag) {
         const close = text.indexOf(tag, i + tag.length);
         end = close < 0 ? text.length : close + tag.length;
@@ -146,9 +171,19 @@ function codeOnly(text: string): string {
   return out + text.slice(copied);
 }
 
-const MAY_DROP = /\bdrop\s+(?:table|view|materialized|function|procedure|routine|type|domain)\b/i;
-const DROP_STATEMENT =
-  /(?:^|;)\s*drop\s+(table|view|materialized\s+view|function|procedure|routine|type|domain)\s+(?:if\s+exists\s+)?([^;]*)/gi;
+/** Where a statement can start: a file's top level, or a PL/pgSQL block. */
+const STATEMENT_START = String.raw`(?:^|;|\b(?:begin|then|else|loop)\b)\s*`;
+const MAY_END = /\b(?:drop|disable|enable)\s/i;
+const DROP_STATEMENT = new RegExp(
+  STATEMENT_START + String.raw`drop\s+(table|view|materialized\s+view|function|procedure|routine|type|domain|trigger)\s+(?:if\s+exists\s+)?([^;]*)`,
+  'gi'
+);
+const DROPPED_TRIGGER = new RegExp(String.raw`^(${IDENT})\s+ON\s+(${QUALIFIED})`, 'i');
+const ALTER_TABLE = new RegExp(
+  STATEMENT_START + String.raw`alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(${QUALIFIED})\s*\*?\s+([^;]*)`,
+  'gi'
+);
+const TRIGGER_SWITCH = new RegExp(String.raw`\b(disable|enable)(?:\s+(replica|always))?\s+trigger\s+(${IDENT})`, 'gi');
 
 /** `a.f(int, text), "B"` → its object names, argument lists and CASCADE dropped. */
 function droppedNames(list: string): string[] {
@@ -164,45 +199,75 @@ function droppedNames(list: string): string[] {
     .map((n) => qualify(n));
 }
 
-/** Every top-level DROP in the project's SQL files, by object class and qualified name. */
-function readDrops(context: ResolutionContext): Map<string, SqlPosition[]> {
-  const drops = new Map<string, SqlPosition[]>();
-  for (const file of context.getAllFiles()) {
-    if (!SQL_FILE.test(file)) continue;
-    const text = context.readFile(file);
-    if (!text || !MAY_DROP.test(text)) continue;
-    const code = codeOnly(text);
-    let line = 1;
-    let counted = 0;
-    for (const m of code.matchAll(DROP_STATEMENT)) {
-      const objectClass = CLASS_OF_DROP[m[1]!.toLowerCase().replace(/\s+/, ' ')]!;
-      const keywordAt = m.index! + m[0].search(/drop/i);
-      for (; counted < keywordAt; counted++) if (code.charCodeAt(counted) === 10) line++;
-      for (const name of droppedNames(m[2]!)) {
-        const key = `${objectClass}:${name}`;
-        const list = drops.get(key) ?? [];
-        list.push({ file, line });
-        drops.set(key, list);
-      }
-    }
-  }
-  return drops;
+/**
+ * A DROP of an object, or an `ALTER TABLE ... DISABLE / ENABLE TRIGGER`.
+ * `ENABLE REPLICA` leaves a trigger firing only on a replica, so it reads as a disable.
+ */
+export interface SqlDdlEvent {
+  at: SqlPosition;
+  kind: 'drop' | 'disable' | 'enable';
 }
 
 /**
- * The DROPs read for one generation of the resolver's caches: the file-node
+ * Every DROP and trigger switch the project's SQL files run as they apply,
+ * keyed `relation:`, `routine:` or `type:` and a qualified name,
+ * `trigger:<table>::<trigger>`, or `triggers:<table>` for `ALL` / `USER`.
+ */
+function readDdl(context: ResolutionContext): Map<string, SqlDdlEvent[]> {
+  const events = new Map<string, SqlDdlEvent[]>();
+  const add = (key: string, event: SqlDdlEvent): void => {
+    const list = events.get(key) ?? [];
+    list.push(event);
+    events.set(key, list);
+  };
+  for (const file of context.getAllFiles()) {
+    if (!SQL_FILE.test(file)) continue;
+    const text = context.readFile(file);
+    if (!text || !MAY_END.test(text)) continue;
+    const code = codeOnly(text, true);
+    const lineAt = makeLineAt(code, 1);
+    const at = (m: RegExpMatchArray): SqlPosition => ({ file, line: lineAt(m.index! + m[0].search(/drop|alter/i)) });
+    for (const m of code.matchAll(DROP_STATEMENT)) {
+      const objectType = m[1]!.toLowerCase().replace(/\s+/, ' ');
+      if (objectType === 'trigger') {
+        const t = DROPPED_TRIGGER.exec(m[2]!);
+        const name = t && splitIdentifierPath(t[1]!)[0];
+        const table = t && foldObjectName(t[2]!);
+        if (name && table) add(`trigger:${qualify(table, name)}`, { at: at(m), kind: 'drop' });
+        continue;
+      }
+      for (const name of droppedNames(m[2]!)) add(`${CLASS_OF_DROP[objectType]}:${name}`, { at: at(m), kind: 'drop' });
+    }
+    for (const m of code.matchAll(ALTER_TABLE)) {
+      const table = foldObjectName(m[1]!);
+      if (!table) continue;
+      for (const s of m[2]!.matchAll(TRIGGER_SWITCH)) {
+        const raw = s[3]!;
+        const kind = s[1]!.toLowerCase() === 'disable' || s[2]?.toLowerCase() === 'replica' ? 'disable' : 'enable';
+        const all = /^(?:all|user)$/i.test(raw);
+        const name = splitIdentifierPath(raw)[0];
+        if (all) add(`triggers:${qualify(table)}`, { at: at(m), kind });
+        else if (name) add(`trigger:${qualify(table, name)}`, { at: at(m), kind });
+      }
+    }
+  }
+  return events;
+}
+
+/**
+ * The DDL read for one generation of the resolver's caches: the file-node
  * list is rebuilt whenever they are cleared, as after a sync.
  */
-const dropIndexes = new WeakMap<ResolutionContext, { source: readonly Node[]; drops: Map<string, SqlPosition[]> }>();
+const ddlIndexes = new WeakMap<ResolutionContext, { source: readonly Node[]; events: Map<string, SqlDdlEvent[]> }>();
 
-function dropsOf(context: ResolutionContext): Map<string, SqlPosition[]> {
+export function sqlDdlEvents(context: ResolutionContext): Map<string, SqlDdlEvent[]> {
   const source = context.getNodesByKind('file');
-  let entry = dropIndexes.get(context);
+  let entry = ddlIndexes.get(context);
   if (!entry || entry.source !== source) {
-    entry = { source, drops: readDrops(context) };
-    dropIndexes.set(context, entry);
+    entry = { source, events: readDdl(context) };
+    ddlIndexes.set(context, entry);
   }
-  return entry.drops;
+  return entry.events;
 }
 
 /**
@@ -228,10 +293,10 @@ function chooseDefinition(qualifiedName: string, defs: Node[], at: SqlPosition, 
     const s = migrationSeries(file);
     return s === null ? defFiles.has(file) : series.has(s);
   };
-  const drops = dropsOf(context);
+  const ddl = sqlDdlEvents(context);
   for (const objectClass of new Set(pool.map((d) => CLASS_OF_KIND[d.kind]))) {
-    for (const drop of drops.get(`${objectClass}:${qualifiedName}`) ?? []) {
-      if (inScope(drop.file)) events.push({ at: drop, node: null });
+    for (const drop of ddl.get(`${objectClass}:${qualifiedName}`) ?? []) {
+      if (inScope(drop.at.file)) events.push({ at: drop.at, node: null });
     }
   }
   return history(events, at);
