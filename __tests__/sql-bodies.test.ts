@@ -99,6 +99,23 @@ describe('PostgreSQL routine bodies', () => {
     ]);
   });
 
+  it("reads a single-quoted body, '' escapes and all, at the file's lines and columns", () => {
+    const source = [
+      "CREATE FUNCTION touch(p int) RETURNS void LANGUAGE plpgsql AS '",
+      'BEGIN',
+      "  UPDATE orders SET note = ''it''''s'' WHERE id = p;",
+      "  INSERT INTO audit (msg) VALUES (''touched'');",
+      "END';",
+      "CREATE FUNCTION paid_count() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM orders WHERE status = ''paid''';",
+    ].join('\n');
+    expect(refs(source)).toEqual([
+      'public::touch references public::orders 3:9 update',
+      'public::touch references public::audit 4:14 insert',
+      'public::paid_count calls public::count 6:68',
+      'public::paid_count references public::orders 6:82 select',
+    ]);
+  });
+
   it('invents nothing for dynamic SQL', () => {
     const source = [
       'CREATE FUNCTION purge(tbl text) RETURNS void LANGUAGE plpgsql AS $$',
