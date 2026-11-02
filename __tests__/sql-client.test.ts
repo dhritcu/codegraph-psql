@@ -231,10 +231,11 @@ describe('Supabase client calls', () => {
     }
   });
 
-  it('links a call only to the schema of a project that contains it, and never from sample code in a template', async () => {
+  it('links a call only to the schema of a project that contains it when several define the name, and never from sample code', async () => {
     const client = "import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(URL, KEY);\n";
     const cg = await indexed({
       'apps/shop/supabase/migrations/001_init.sql': 'CREATE TABLE todos (id int);\n',
+      'apps/blog/supabase/migrations/001_init.sql': 'CREATE TABLE todos (id int);\n',
       'apps/shop/src/list.ts': client + "export function mine() {\n  return supabase.from('todos').select();\n}\n",
       'apps/docs/src/list.ts': client + "export function theirs() {\n  return supabase.from('todos').select();\n}\n",
       'apps/shop/src/sample.ts':
@@ -243,6 +244,24 @@ describe('Supabase client calls', () => {
     try {
       expect(dbEdges(cg)).toEqual([
         "mine -references-> public::todos {op=select ops=select} supabase .from('todos').select @4",
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+});
+
+describe('Supabase client calls in a monorepo', () => {
+  it('links app code to the one schema a package holds, through a one-line template name', async () => {
+    const cg = await indexed({
+      'packages/db/supabase/migrations/001_init.sql': 'CREATE TABLE todos (id int);\n',
+      'apps/web/lib/todos.ts':
+        "import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(URL, KEY);\n" +
+        'export function list() {\n  return supabase.from(`todos`).select();\n}\n',
+    });
+    try {
+      expect(dbEdges(cg)).toEqual([
+        "list -references-> public::todos {op=select ops=select} supabase .from('todos').select @4",
       ]);
     } finally {
       cg.destroy();
@@ -267,14 +286,26 @@ describe('Knex, Kysely and Drizzle', () => {
         "  return db.from('app.audit').select('*');",
         '}',
       ].join('\n'),
+      'src/jobs.js': [
+        "const knex = require('knex')({ client: 'pg' });",
+        'async function bump(id) {',
+        "  await knex('orders').where({ id }).increment('total', 1);",
+        '}',
+        'function preview(id) {',
+        "  return knex('orders').where({ id }).toString();",
+        '}',
+        'module.exports = { bump, preview };',
+      ].join('\n'),
     });
     try {
       expect(dbEdges(cg)).toEqual([
         "add -calls-> public::on_insert {event=insert} trigger public::orders::orders_insert @3",
         "add -references-> public::orders {op=insert ops=insert} knex ('orders').insert @3",
         "all -references-> app::audit {op=select ops=select} knex .from('app.audit') @9",
+        "bump -references-> public::orders {op=update ops=update columns=total} knex ('orders').increment @3",
         "pay -calls-> public::on_status {event=update} trigger public::orders::orders_status @6",
         "pay -references-> public::orders {op=update ops=update columns=status} knex ('orders').update @6",
+        "preview -references-> public::orders {op=select ops=select} knex ('orders') @6",
       ]);
     } finally {
       cg.destroy();

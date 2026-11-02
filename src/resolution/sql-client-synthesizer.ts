@@ -147,8 +147,8 @@ function splitTopLevel(text: string): string[] {
 
 /**
  * `s` with the text of every template literal blanked, offsets and newlines
- * kept: a template holds sample code (a docs page's `supabase.from('todos')`)
- * far more often than a query.
+ * kept, but for a bare name (`` `orders` ``): a template holds sample code (a
+ * docs page's `supabase.from('todos')`) far more often than a query.
  */
 function blankTemplates(s: string): string {
   let out = '';
@@ -157,7 +157,7 @@ function blankTemplates(s: string): string {
     const ch = s[i];
     if (ch !== '"' && ch !== "'" && ch !== '`') continue;
     const end = skipString(s, i);
-    if (ch === '`') {
+    if (ch === '`' && !/^[\w.]+$/.test(s.slice(i + 1, end))) {
       out += s.slice(copied, i + 1) + s.slice(i + 1, end).replace(/[^\n]/g, ' ');
       copied = end;
     }
@@ -250,7 +250,7 @@ function importsOf(ctx: ResolutionContext, file: string, safe: string): ImportMa
   const mapped = ctx.getImportMappings(file, lang);
   // `const knex = require('knex')` reaches the mappings only in some extractors.
   const required: ImportMapping[] = [];
-  for (const m of safe.matchAll(new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)`, 'g'))) {
+  for (const m of safe.matchAll(new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)(?!\s*\()`, 'g'))) {
     required.push({ localName: m[1]!, exportedName: 'default', source: m[3]!, isDefault: true, isNamespace: false });
   }
   for (const m of safe.matchAll(new RegExp(String.raw`\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)`, 'g'))) {
@@ -323,10 +323,16 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
       const fn = enclosingFn(nodes, lineOf(call.index));
       if (!fn) continue;
       const body = safe.slice(lineStarts[fn.startLine - 1] ?? 0, lineStarts[fn.endLine] ?? safe.length);
-      if (returned.test(before) || (name && new RegExp(String.raw`\breturn\s+${escape(name)}\b`).test(body))) {
+      if (returned.test(before) || (name && new RegExp(String.raw`\breturn\s+${escape(name)}\s*(?:;|\}|$)`, 'm').test(body))) {
         factories.set(fn.name, call.binding);
       }
     }
+  }
+  // `const knex = require('knex')({ client: 'pg' })`: the factory called where it is required.
+  const requiredCall = new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)\s*\(`, 'g');
+  for (const m of safe.matchAll(requiredCall)) {
+    const client = factoryClient([{ localName: m[1]!, exportedName: 'default', source: m[3]!, isDefault: true, isNamespace: false }], m[1]!);
+    if (client && !FACTORIES[client].isNew) instances.set(m[1]!, { client, schema: null });
   }
   const def = new RegExp(String.raw`\bexport\s+default\s+(${IDENT})\s*;?\s*$`, 'm').exec(safe);
   return { file, safe, instances, factories, defaultExport: def ? { name: def[1]! } : null, imports };
@@ -436,7 +442,7 @@ function supabaseSites(safe: string, receiver: string, binding: Binding, out: Si
     const table = tableName(value, schema);
     // PostgREST takes a bare table name; the schema comes from `.schema()` or the client.
     if (!table || /[\s.]/.test(value)) continue;
-    const link = chainAfter(safe, close + 1).find((l) => SUPABASE_OPS[l.method]);
+    const link = chainAfter(safe, close + 1).find((l) => Object.hasOwn(SUPABASE_OPS, l.method));
     if (!link) continue;
     const upsert = link.method === 'upsert';
     const columns = link.method === 'update' || upsert ? payloadKeys(link.args[0]) : null;
@@ -458,11 +464,14 @@ function knexSites(safe: string, receiver: string, out: Site[]): void {
     const table = value ? tableName(value, null) : null;
     if (!value || !table) continue;
     const chain = chainAfter(safe, close + 1);
-    const write = chain.find((l) => KNEX_OPS[l.method]);
+    const write = chain.find((l) => Object.hasOwn(KNEX_OPS, l.method));
     const merge = chain.some((l) => l.method === 'merge') && chain.some((l) => l.method === 'onConflict');
     const ops: Op[] = write ? [KNEX_OPS[write.method]!] : ['select'];
     if (merge && ops[0] === 'insert') ops.push('update');
-    const columns = write?.method === 'update' ? payloadKeys(write.args[0]) : merge ? payloadKeys(write?.args[0]) : null;
+    const counter = write && /^(?:in|de)crement$/.test(write.method) ? literal(write.args[0] ?? '') : null;
+    const columns = counter ? [counter] : write?.method === 'update' || /^(?:in|de)crement$/.test(write?.method ?? '') || merge
+      ? payloadKeys(write?.args[0])
+      : null;
     out.push({ client: 'knex', index: m[1] ? m.index! + m[0].lastIndexOf(m[1]) : m.index!, call: `${m[1] ? `.${m[1]}` : ''}('${value}')${write ? `.${write.method}` : ''}`,
       target: { kind: 'table', ...table }, ops, columns, upsert: merge, declaration: false });
   }
@@ -552,19 +561,21 @@ function seriesOf(filePath: string): string {
 
 /**
  * The directory of the project a migration series belongs to: the series path
- * up to its `supabase/`, `migrations/`, `db/` … directory (`examples/todo` for
- * `examples/todo/supabase/migrations`); a schema file's own directory.
+ * without its trailing `migrations/` and the `supabase/`, `prisma/`, `db/` …
+ * directory holding it (`packages/db` for `packages/db/supabase/migrations`);
+ * a schema file's own directory.
  */
 function projectRoot(series: string, isFile: boolean): string {
   const parts = series.split('/');
   if (isFile) parts.pop();
-  const at = parts.findIndex((p) => /^(?:supabase|migrations?|db|database|sql|schema|prisma)$/i.test(p));
-  return (at >= 0 ? parts.slice(0, at) : parts).join('/');
+  if (/^migrations?$/i.test(parts[parts.length - 1] ?? '')) parts.pop();
+  if (/^(?:supabase|prisma|db|database|sql|schema)$/i.test(parts[parts.length - 1] ?? '')) parts.pop();
+  return parts.join('/');
 }
 
 /**
  * The SQL object a client call names, as the database has it once every
- * migration ran. A repo may hold several schemas (an app per directory): a
+ * migration ran. A repo may hold several schemas (an app per directory): then a
  * definition counts only when its project directory contains the calling
  * file, the deepest such project wins, and two series or files of equal depth
  * make the name ambiguous and yield nothing. Within one series the
@@ -577,10 +588,12 @@ function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: stri
   if (defs.length === 0) return null;
   let best = -1;
   let groups = new Set<string>();
+  const all = new Set(defs.map((d) => seriesOf(d.filePath)));
   for (const d of defs) {
     const series = seriesOf(d.filePath);
     const root = projectRoot(series, series === d.filePath);
-    if (root !== '' && !fromFile.startsWith(`${root}/`)) continue;
+    // One schema in the repo is the app's, wherever its package sits.
+    if (root !== '' && !fromFile.startsWith(`${root}/`) && all.size > 1) continue;
     const depth = root === '' ? 0 : root.split('/').length;
     if (depth > best) {
       best = depth;
