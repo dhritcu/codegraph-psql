@@ -55,36 +55,18 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { isTestPath } from '../search/query-utils';
 import { enclosingFn, enclosingValue, FN_KINDS, makeLineAt } from './synth-utils';
 import { postgresResolver } from './frameworks/postgres';
+import { migrationSeries, SQL_CLIENT_TYPES, SQL_FILE, sqlClients, type QueryBuilderClient } from './sql-model';
 import { qualify, DEFAULT_SCHEMA } from '../extraction/languages/postgres-names';
 import { pgTriggerEdges } from './pg-trigger-synthesizer';
 
-type Client = 'supabase' | 'knex' | 'kysely' | 'drizzle';
+type Client = QueryBuilderClient | 'drizzle';
 type Op = 'select' | 'insert' | 'update' | 'delete';
 
 const JS_FILE = /\.(?:[cm]?[jt]sx?)$/;
-const SQL_FILE = /\.(?:sql|psql|pgsql)$/i;
 const IDENT = String.raw`[A-Za-z_$][\w$]*`;
 const escape = (name: string): string => name.replace(/\$/g, '\\$');
 
-/** Where each client's factory is imported from, and how it is called. */
-const FACTORIES: Readonly<Record<Exclude<Client, 'drizzle'>, { packages: Record<string, readonly string[]>; isNew: boolean }>> = {
-  supabase: {
-    packages: {
-      '@supabase/supabase-js': ['createClient'],
-      '@supabase/ssr': ['createServerClient', 'createBrowserClient'],
-    },
-    isNew: false,
-  },
-  knex: { packages: { knex: ['default', 'knex', 'Knex'] }, isNew: false },
-  kysely: { packages: { kysely: ['Kysely'] }, isNew: true },
-};
-
-/** The type of a client instance, by the package that exports it: a parameter annotated with one is a client. */
-const CLIENT_TYPES: Readonly<Record<string, Readonly<Record<string, Binding['client']>>>> = {
-  '@supabase/supabase-js': { SupabaseClient: 'supabase' },
-  knex: { Knex: 'knex' },
-  kysely: { Kysely: 'kysely' },
-};
+const FACTORIES = sqlClients('builder');
 
 const DRIZZLE_PACKAGE = 'drizzle-orm/pg-core';
 
@@ -239,7 +221,7 @@ function chainAfter(s: string, from: number): Link[] {
 // =============================================================================
 
 interface Binding {
-  client: Exclude<Client, 'drizzle'>;
+  client: QueryBuilderClient;
   /** The schema the client's options name (`db: { schema: 'x' }`). */
   schema: string | null;
 }
@@ -294,7 +276,7 @@ function factoryClient(imports: readonly ImportMapping[], local: string): Bindin
   for (const im of imports) {
     if (im.localName !== local) continue;
     const pkg = packageOf(im.source);
-    for (const [client, f] of Object.entries(FACTORIES) as [Binding['client'], (typeof FACTORIES)[Binding['client']]][]) {
+    for (const [client, f] of FACTORIES) {
       const names = f.packages[pkg];
       if (names?.includes(im.isDefault ? 'default' : im.exportedName)) return client;
     }
@@ -314,7 +296,7 @@ function factoryCalls(safe: string, imports: readonly ImportMapping[]): { index:
   for (const m of safe.matchAll(new RegExp(String.raw`(?<![\w$.])(new\s+)?(${IDENT})\s*(?:<[^()]*?>)?\s*\(`, 'g'))) {
     if (!locals.has(m[2]!)) continue;
     const client = factoryClient(imports, m[2]!);
-    if (!client || FACTORIES[client].isNew !== !!m[1]) continue;
+    if (!client || (FACTORIES.get(client)!.make === 'new') !== !!m[1]) continue;
     const open = m.index! + m[0].length - 1;
     calls.push({ index: m.index!, binding: { client, schema: client === 'supabase' ? optionsSchema(safe, open) : null } });
   }
@@ -352,11 +334,11 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   const requiredCall = new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)\s*\(`, 'g');
   for (const m of safe.matchAll(requiredCall)) {
     const client = factoryClient([{ localName: m[1]!, exportedName: 'default', source: m[3]!, isDefault: true, isNamespace: false }], m[1]!);
-    if (client && !FACTORIES[client].isNew) bind(instances, m[1]!, { binding: { client, schema: null }, scope: enclosingFn(nodes, lineOf(m.index!)) });
+    if (client && FACTORIES.get(client)!.make !== 'new') bind(instances, m[1]!, { binding: { client, schema: null }, scope: enclosingFn(nodes, lineOf(m.index!)) });
   }
   const types = new Map<string, Binding['client']>();
   for (const im of imports) {
-    const client = CLIENT_TYPES[packageOf(im.source)]?.[im.exportedName];
+    const client = SQL_CLIENT_TYPES[packageOf(im.source)]?.[im.exportedName];
     if (client && !im.isDefault) types.set(im.localName, client);
   }
   if (types.size > 0) {
@@ -622,15 +604,6 @@ function sitesIn(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): S
 const SQL_LANGUAGES: ReadonlySet<string> = new Set(['postgres', 'plpgsql']);
 const TARGET_KIND: Readonly<Record<SqlTarget['kind'], string>> = { table: 'class', function: 'function' };
 
-/** A migration series, by the rule the Postgres resolver applies; for a file that is no migration, the file. */
-function seriesOf(filePath: string): string {
-  const parts = filePath.split('/');
-  const numbered = parts.findIndex((p) => /^\d+(?:[_\-.]|$)/.test(p));
-  if (numbered >= 0) return parts.slice(0, numbered).join('/');
-  const dir = parts.slice(0, -1);
-  return dir.some((p) => /^migrations?$/i.test(p)) ? dir.join('/') : filePath;
-}
-
 /**
  * The directory of the project a migration series belongs to: the series path
  * without its trailing `migrations/` and the `supabase/`, `prisma/`, `db/` …
@@ -707,9 +680,9 @@ export function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFil
   if (defs.length === 0) return null;
   let best = -1;
   let groups = new Set<string>();
-  const all = new Set(defs.map((d) => seriesOf(d.filePath)));
+  const all = new Set(defs.map((d) => migrationSeries(d.filePath, 'file')));
   for (const d of defs) {
-    const series = seriesOf(d.filePath);
+    const series = migrationSeries(d.filePath, 'file');
     const root = projectRoot(series, series === d.filePath);
     if (root !== '' && !fromFile.startsWith(`${root}/`) && (all.size > 1 || !sharesSchema(ctx, root, fromFile, packages))) continue;
     const depth = root === '' ? 0 : root.split('/').length;

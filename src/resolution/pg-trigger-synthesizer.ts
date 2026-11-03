@@ -17,7 +17,7 @@
  * A trigger's WHEN condition is not evaluated; it is recorded on the edge.
  *
  * Triggers apply in migration order like every other object, read from the
- * Postgres resolver's one model of what a migration ends: the latest CREATE
+ * shared SQL model of what a migration ends (`sql-model.ts`): the latest CREATE
  * TRIGGER of a name on a table wins; a later DROP of the trigger, its table or
  * its function leaves none; `ALTER TABLE ... DISABLE TRIGGER` stops it until
  * an ENABLE. A write a migration runs itself (a DO block) fires the triggers
@@ -34,8 +34,9 @@ import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
 import { splitIdentifierPath } from '../extraction/languages/postgres-names';
 import {
-  codeOnly, comparePositions, ddlScope, IDENT, QUALIFIED, sqlDdlEvents, type SqlDdlEvent, type SqlPosition,
-} from './frameworks/postgres';
+  codeOnly, compareNodes, comparePositions, ddlAfter, IDENT, migrationSeries, nodePosition, QUALIFIED, routineDropKeys, SQL_FILE,
+  sqlDdlEvents, triggerDropKeys, type SqlDdl, type SqlPosition,
+} from './sql-model';
 
 type TriggerEvent = 'insert' | 'update' | 'delete' | 'truncate';
 
@@ -57,8 +58,6 @@ interface WriteAction {
   event: TriggerEvent;
   columns: ReadonlySet<string> | null;
 }
-
-const SQL_FILE = /\.(?:sql|psql|pgsql)$/i;
 
 const TRIGGER_HEAD = new RegExp(
   String.raw`^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+${IDENT}\s+(BEFORE|AFTER|INSTEAD\s+OF)\s+([\s\S]+?)\s+ON\s+`,
@@ -229,7 +228,7 @@ function tableOf(queries: QueryBuilder, trigger: Node): string | null {
 
 const WRITE_OPS = new Set(['insert', 'update', 'delete', 'merge']);
 
-const at = (node: Node): SqlPosition => ({ file: node.filePath, line: node.startLine });
+const fileSeries = (file: string): string => migrationSeries(file, 'file');
 
 /**
  * The definition among `defs` (one trigger's, in apply order) in force at
@@ -237,21 +236,17 @@ const at = (node: Node): SqlPosition => ({ file: node.filePath, line: node.start
  * created by then that no DROP of it, its table or its function, and no
  * DISABLE TRIGGER without a later ENABLE, has ended by then.
  */
-function inForce(defs: Trigger[], when: SqlPosition | null, ddl: Map<string, SqlDdlEvent[]>): Trigger | null {
-  const created = when ? defs.filter((d) => comparePositions(at(d.node), when) <= 0) : defs;
+function inForce(defs: Trigger[], when: SqlPosition | null, ddl: SqlDdl): Trigger | null {
+  const created = when ? defs.filter((d) => comparePositions(nodePosition(d.node), when) <= 0) : defs;
   const def = created[created.length - 1];
   if (!def) return null;
-  const scope = ddlScope(def.node.filePath);
-  const since = (e: SqlDdlEvent): boolean =>
-    ddlScope(e.at.file) === scope && comparePositions(e.at, at(def.node)) > 0 && (!when || comparePositions(e.at, when) <= 0);
-  const trigger = `trigger:${def.node.qualifiedName}`;
-  const ends = [trigger, `relation:${def.tableName}`, `routine:${def.fnName}`]
-    .some((key) => ddl.get(key)?.some((e) => e.kind === 'drop' && since(e)));
+  const from = nodePosition(def.node);
+  const trigger = def.node.qualifiedName;
+  const ends = ddlAfter(ddl, triggerDropKeys(trigger, def.tableName, routineDropKeys(def.fnName, null)), from, fileSeries, when)
+    .some((e) => e.kind === 'drop');
   if (ends) return null;
-  const switches = [trigger, `triggers:${def.tableName}`]
-    .flatMap((key) => ddl.get(key) ?? [])
-    .filter((e) => e.kind !== 'drop' && since(e))
-    .sort((x, y) => comparePositions(x.at, y.at));
+  const switches = ddlAfter(ddl, [`trigger:${trigger}`, `triggers:${def.tableName}`], from, fileSeries, when)
+    .filter((e) => e.kind !== 'drop');
   return switches[switches.length - 1]?.kind === 'disable' ? null : def;
 }
 
@@ -268,14 +263,14 @@ export async function pgTriggerEdges(queries: QueryBuilder, ctx: ResolutionConte
     const tableName = table && queries.getNodeById(table)?.qualifiedName;
     const fnName = fn && queries.getNodeById(fn)?.qualifiedName;
     if (!head || !table || !fn || !tableName || !fnName) continue;
-    const key = `${ddlScope(node.filePath)}\0${node.qualifiedName}`;
+    const key = `${fileSeries(node.filePath)}\0${node.qualifiedName}`;
     const defs = histories.get(key) ?? [];
     defs.push({ node, table, fn, tableName, fnName, ...head });
     histories.set(key, defs);
   }
   const byTable = new Map<string, Trigger[][]>();
   for (const defs of histories.values()) {
-    defs.sort((x, y) => comparePositions(at(x.node), at(y.node)));
+    defs.sort((x, y) => compareNodes(x.node, y.node));
     for (const table of new Set(defs.map((d) => d.table))) {
       const list = byTable.get(table) ?? [];
       list.push(defs);
@@ -298,7 +293,7 @@ export async function pgTriggerEdges(queries: QueryBuilder, ctx: ResolutionConte
         : null;
       const actions = writeActions(op, sqlStatementAt(ctx, writer, write), write.metadata?.columns);
       for (const defs of tableHistories) {
-        const when = runsAt && ddlScope(runsAt.file) === ddlScope(defs[0]!.node.filePath) ? runsAt : null;
+        const when = runsAt && fileSeries(runsAt.file) === fileSeries(defs[0]!.node.filePath) ? runsAt : null;
         const trigger = inForce(defs, when, ddl);
         if (!trigger || trigger.table !== table) continue;
         const action = actions.find((a) => fires(trigger, a));
