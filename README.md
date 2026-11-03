@@ -56,8 +56,38 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 </div>
 
+## PostgreSQL support (this fork)
+
+This checkout is [codegraph-psql](FORK.md), a fork that also indexes PostgreSQL and PL/pgSQL. It reads the `.sql`, `.psql`, and `.pgsql` files in your project, migrations included, and links TypeScript and JavaScript code to the tables and functions those files define. The fork is never published to npm, so the install steps in [Get Started](#get-started) install upstream CodeGraph, not this fork. Install the fork from source instead:
+
+```bash
+git clone git@github.com:dhritcu/codegraph-psql.git
+cd codegraph-psql
+npm ci
+npm run build
+npm link
+```
+
+You need Node 24, or Node 22.23 or newer. Run `which -a codegraph` to check that the fork's link comes first on your `PATH`. [FORK.md](FORK.md) covers updating and the upstream install that can shadow it.
+
+Then index a project that has SQL migrations:
+
+```bash
+cd your-project
+codegraph init
+codegraph explore "orders table insert trigger"
+```
+
+What to expect:
+
+- Tables, views, columns, functions, triggers, types, indexes, and policies become symbols. Names fold the way Postgres folds them, and the latest migration wins: a dropped or redefined object is marked as such.
+- `codegraph_explore` follows a write into the table it touches and on to the trigger functions that write fires. A table's block lists its live triggers, its writers, and its policies.
+- Calls through Supabase (`.from`, `.rpc`), Knex, Kysely, Drizzle, node-postgres, postgres.js, Slonik, and Prisma's raw SQL link to the tables and functions they name.
+- Some SQL stays unlinked: dynamic `EXECUTE`, SQL built by string concatenation, Prisma's model API, and project-defined query wrappers. [docs/design/postgres-support.md](docs/design/postgres-support.md) lists every known gap and the measured results.
+
 ## Contents
 
+- [PostgreSQL support (this fork)](#postgresql-support-this-fork)
 - [Get Started](#get-started)
 - [Language Support](#language-support)
 - [Why CodeGraph?](#why-codegraph)

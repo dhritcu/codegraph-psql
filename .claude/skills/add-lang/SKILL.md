@@ -105,8 +105,8 @@ These are exact, fragile wiring — match the existing style precisely:
      without the entry, `codegraph init` finds **0 files** even though
      detection and extraction are wired.
    - `getLanguageDisplayName`: `<lang>: '<Display Name>',`
-   - **vendored only**: add `<lang>` to the
-     `(lang === 'pascal' || lang === 'scala' || …)` wasm-path branch.
+   - **vendored only**: add `<lang>` to the `VENDORED_WASM_LANGS` set, which
+     `resolveWasmPath` reads to load the wasm from `dist/extraction/wasm/`.
 3. **`src/extraction/languages/<lang>.ts`** — new file exporting
    `export const <lang>Extractor: LanguageExtractor = { … }`. Map the node types
    from Step 3. Required fields: `functionTypes`, `classTypes`, `methodTypes`,
