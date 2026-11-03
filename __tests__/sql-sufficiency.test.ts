@@ -174,9 +174,11 @@ describe('a SQL table\'s write path, complete enough to stop reading migrations'
     });
     try {
       const text = await explore(cg, 'objects_delete_cleanup trigger on storage.objects delete');
-      expect(sourceFiles(text).slice(0, 2)).toEqual([
+      expect(sourceFiles(text)).toEqual([
+        'migrations/tenant/0001-objects.sql',
         'migrations/tenant/0006-protect.sql',
         'migrations/tenant/0008-lifecycle.sql',
+        'src/storage/objects.ts',
       ]);
       expect(text).toContain([
         '> Not printed, because a later migration dropped or redefined them and their bodies no longer run:',
