@@ -4,8 +4,19 @@ Changes in the codegraph-psql fork. Upstream's changes are in `CHANGELOG.md`.
 
 ## [Unreleased]
 
+### Highlights
+
+- CodeGraph now indexes PostgreSQL and PL/pgSQL: tables, views, functions, triggers, types, indexes, and policies from your `.sql` migrations.
+- Migrations apply in order, so a dropped or redefined table, function, or trigger shows as such and only live triggers count.
+- `codegraph_explore` follows a write into its table and on to the trigger functions it fires, and lists a table's live triggers and writers in one block.
+- TypeScript and JavaScript code that queries Postgres through Supabase, Knex, Kysely, Drizzle, node-postgres, postgres.js, Slonik, or Prisma's raw SQL now links to the tables and functions it names.
+- The fork installs from a source checkout with `npm link`, sends no telemetry by default, and never replaces itself with upstream CodeGraph.
+- Run `codegraph index` in each project you indexed before, so it picks up its SQL files.
+
 ### New Features
 
+- `.sql`, `.psql`, and `.pgsql` files are now indexed with a PostgreSQL grammar, and PL/pgSQL function bodies are read too, so their tables, columns, functions, triggers, types, indexes, and policies become symbols you can search and explore.
+- A new PostgreSQL support guide in the docs explains what the fork indexes, how it reads migrations, and what it cannot see yet, with results from three real projects.
 - The fork installs from a source checkout with `npm link`, and `FORK.md` explains setup, updating, and syncing with upstream.
 - Every pull request now runs the build and the full test suite on macOS and Linux.
 - `codegraph_explore` follows a SQL write through the table it touches into the trigger it fires, and a flow can end at a table you name, with the operation (`insert into orders`) and the trigger's timing and event on each hop.
@@ -28,6 +39,7 @@ Changes in the codegraph-psql fork. Upstream's changes are in `CHANGELOG.md`.
 - `codegraph install` no longer offers to install upstream CodeGraph with `npm install -g`, which replaced the fork on your `PATH`; it tells you to run `npm link` in the fork's checkout instead.
 - The installer's usage-stats question now defaults to No, so pressing Enter keeps telemetry off.
 - `codegraph upgrade` in a source checkout now prints the full update command, including `npm ci`.
+- When CodeGraph fails to load, it now tells you to rebuild the fork from its checkout instead of reinstalling upstream CodeGraph.
 - A `.sql` file written for MySQL or SQLite now indexes the statements PostgreSQL also reads, without a "could not be parsed" warning (#4).
 - `codegraph index` and `codegraph status` now name the files skipped for being over 1 MiB, such as a large `structure.sql` (#6).
 - A PL/pgSQL variable or parameter with the same name as a table no longer hides that table's reads and writes.

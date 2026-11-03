@@ -30,8 +30,8 @@ the flag, keeps its own setting until it exits; `codegraph telemetry off` covers
 every process.
 
 `codegraph telemetry status` shows the current state, what decided it, and your machine ID.
-The interactive installer (`codegraph install`) asks up front with a visible default-on
-toggle and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
+The interactive installer (`codegraph install`) asks up front with a toggle that
+defaults to off and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
 a one-line notice is printed to stderr before the first time anything is sent.
 
 Off means off: when disabled, CodeGraph records nothing, opens no connection to the

@@ -183,6 +183,26 @@ Twig, ArkTS, and the `.svelte` / `.vue` / `.astro` template languages.
 A language with no rules yields **nothing**, never a wrong label — that is the
 design, so an absent row here is a missing feature, not a bug.
 
+**PostgreSQL and PL/pgSQL (codegraph-psql fork only, verified 2026-11-03).**
+`.sql`, `.psql` and `.pgsql` files have full structural extraction, and the
+database flow is bridged end to end: SQL writer → table → trigger function, and
+TypeScript / JavaScript client → table or function. On the three axes:
+
+| Axis | State | What is left |
+|---|---|---|
+| `route` nodes | none. SQL has no routes, and an HTTP route reaches SQL through the TS client links | nothing |
+| `navigates` edges | none, not applicable | nothing |
+| `WHEN` rules | none for PL/pgSQL `IF` and `CASE`. A trigger's own `WHEN (...)` is recorded on its edge but not drawn as a guard | a `plpgsql` entry in `RULES_BY_LANGUAGE` |
+
+TypeScript links cover Supabase (`.from`, `.rpc`), Knex, Kysely, Drizzle
+`pgTable`, and SQL strings on node-postgres, postgres.js, Slonik, Drizzle,
+Kysely, Knex `.raw()` and Prisma `$queryRaw` / `$executeRaw`. Not covered:
+Prisma's model API, TypeORM, Sequelize, project-defined query wrappers (fork
+issue #30), and dynamic `EXECUTE`. Mechanism, gaps and the A/B results:
+[postgres-support.md](postgres-support.md). Re-verify with
+`sqlite3 .codegraph/codegraph.db "select json_extract(metadata,'$.synthesizedBy') s, count(*) from edges where s in ('sql-client','sql-embedded','pg-trigger') group by s"`
+on an indexed Supabase repository.
+
 **Ruby and Rust sting most**: both have server frameworks in the README's table
 (Rails, Axum/actix/Rocket), so their Steps pictures draw responses and database
 calls with no conditions on any arrow. `scripts/try-repo.sh`'s `bookstack`

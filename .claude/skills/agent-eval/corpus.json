@@ -11,6 +11,7 @@
     {
       "name": "excalidraw",
       "repo": "https://github.com/excalidraw/excalidraw",
+      "sha": "8bcdca4526867433f99fdfcb55a063668db0c9dc",
       "size": "Medium",
       "files": "~600",
       "question": "How does Excalidraw render and update canvas elements?"
@@ -27,6 +28,7 @@
     {
       "name": "express",
       "repo": "https://github.com/expressjs/express",
+      "sha": "43fca52d28a422c8be48fd489cbd4f2d6152bab6",
       "size": "Small",
       "files": "~50",
       "question": "How does Express route a request through its middleware stack?"
@@ -615,7 +617,12 @@
       "sha": "7a39b19dedd426aca7c3639533d7f84aa605b4b8",
       "size": "Small",
       "files": "~840 (114 .sql)",
-      "question": "What happens in the database when a row in storage.objects is deleted? Trace from the objects table through its triggers to the functions they execute, such as storage.objects_delete_cleanup."
+      "question": "What happens in the database when a row in storage.objects is deleted? Trace from the objects table through its triggers to the functions they execute, such as storage.objects_delete_cleanup.",
+      "prompts": [
+        "What happens in the database when a row in storage.objects is deleted? Trace from the objects table through its triggers to the functions they execute, such as storage.objects_delete_cleanup.",
+        "What happens in the database when a row in storage.objects is updated, for example when an object's metadata changes? Trace from the objects table through every trigger that is still live after the last migration to the function it executes, and say what that function changes.",
+        "Which SQL functions and migration statements write to storage.objects (insert, update, or delete), and which triggers fire for each of those writes? Trace from each writer to the objects table and on to the trigger functions."
+      ]
     },
     {
       "name": "cal.com",
@@ -623,7 +630,12 @@
       "sha": "81ce067c1d0e16b21c39c2de98b9a43a92562cd1",
       "size": "Medium",
       "files": "~600 .sql (packages/prisma/migrations)",
-      "question": "Which tables does a Booking row point at through its foreign keys, and which tables point back at Booking? Trace from the Booking table across the Prisma migrations to User, EventType, and Attendee."
+      "question": "Which tables does a Booking row point at through its foreign keys, and which tables point back at Booking? Trace from the Booking table across the Prisma migrations to User, EventType, and Attendee.",
+      "prompts": [
+        "Which database tables does the tRPC handler listWithTeamHandler read or write through its raw SQL query, and in which Prisma migration is each of those tables first created?",
+        "When a row in the Booking table is inserted or updated, which database trigger fires, which chain of SQL functions does it run, and which table ends up written? Trace from Booking through its trigger to the functions and the table they write.",
+        "Which tables does a Booking row point at through its foreign keys, and which tables point back at Booking? Trace from the Booking table across the Prisma migrations to User, EventType, and Attendee."
+      ]
     },
     {
       "name": "supabase",
@@ -631,7 +643,12 @@
       "sha": "b98eca75c70e335b1f1ca3187c46826cc15dd2b2",
       "size": "Large",
       "files": "~18000 (111 .sql)",
-      "question": "How does a new auth user get a row in public.profiles in the user-management examples? Trace from the trigger on auth.users to the handle_new_user function it executes and the profiles table that function writes."
+      "question": "How does a new auth user get a row in public.profiles in the user-management examples? Trace from the trigger on auth.users to the handle_new_user function it executes and the profiles table that function writes.",
+      "prompts": [
+        "When the docs site's error-code sync uploads error codes, which SQL function does its .rpc() call reach, which tables does that function write, and what fires on those writes? Trace from uploadErrorCodes in apps/docs to the database.",
+        "When the knowledge-base sync script updates a troubleshooting entry, what happens in the database? Trace from syncDiscussionUpdates in apps/kb through its .from('troubleshooting_entries').update() call to the table, its triggers, and the function each trigger runs.",
+        "In the nextjs-slack-clone example, which tables do the functions in lib/Store.js write to (insert, update, or delete), and which row-level security policies in the example's migration govern each of those writes? Trace from addMessage, addChannel, deleteChannel, and deleteMessage to the tables."
+      ]
     }
   ]
 }
