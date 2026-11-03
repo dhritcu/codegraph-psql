@@ -4284,6 +4284,40 @@ export class ToolHandler {
   }
 
   /**
+   * Puts the files of a Flow that runs through SQL ahead of every other file
+   * but a named table's write path (`ahead`), in hop order, so the file cap
+   * keeps each hop's body: on a small tier a hop's file otherwise loses its
+   * slot to a view that merely matches a word. A flow with no SQL hop is left
+   * alone.
+   */
+  private leadWithSqlFlow(
+    cg: CodeGraph,
+    sortedFiles: Array<[string, { nodes: Node[]; score: number; peripheral: number }]>,
+    fileGroups: Map<string, { nodes: Node[]; score: number; peripheral: number }>,
+    pathNodeIds: Set<string>,
+    ahead: ReadonlySet<string>,
+  ): void {
+    const byId = cg.getNodesByIds([...pathNodeIds]);
+    const hops = [...pathNodeIds].map((id) => byId.get(id)).filter((n): n is Node => !!n);
+    if (!hops.some(isSqlNode)) return;
+    const top = sortedFiles[0]?.[1].score ?? 0;
+    const lead = sortedFiles.filter(([fp]) => ahead.has(fp));
+    for (const hop of hops) {
+      if (isSqlNode(hop) && (hop.kind === 'function' || hop.kind === 'method') && sqlHistoryNote(cg, hop)) continue;
+      let group = fileGroups.get(hop.filePath);
+      if (!group) {
+        group = { nodes: [], score: top, peripheral: 0 };
+        fileGroups.set(hop.filePath, group);
+      }
+      group.score = Math.max(group.score, top);
+      if (!group.nodes.some((n) => n.id === hop.id)) group.nodes.push(hop);
+      if (!lead.some(([fp]) => fp === hop.filePath)) lead.push([hop.filePath, group]);
+    }
+    const rest = sortedFiles.filter(([fp]) => !lead.some(([l]) => l === fp));
+    sortedFiles.splice(0, sortedFiles.length, ...lead, ...rest);
+  }
+
+  /**
    * Hands a table's write path the source budget first: the live trigger
    * functions and the writers that fire them lead the ranked files, funded as
    * exact targets, and a routine or trigger a later migration dropped or
@@ -5604,6 +5638,7 @@ export class ToolHandler {
     await warmBranchGuardGrammars();
     const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
     const sqlOmitted = sqlTables.text ? this.focusSqlWritePath(cg, sortedFiles, fileGroups, sqlTables.bodies, exactNodeIds) : [];
+    this.leadWithSqlFlow(cg, sortedFiles, fileGroups, flow.pathNodeIds, new Set(sqlTables.text ? sqlTables.bodies.map((n) => n.filePath) : []));
 
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);
