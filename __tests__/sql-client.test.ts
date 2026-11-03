@@ -2,11 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
 import { SYNTH_PASSES } from '../src/resolution/callback-synthesizer';
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'postgres-ts');
+const BIN = path.join(__dirname, '..', 'dist', 'bin', 'codegraph.js');
 
 let dir: string;
 
@@ -15,6 +17,10 @@ function write(files: Record<string, string>): void {
     fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
     fs.writeFileSync(path.join(dir, rel), content);
   }
+}
+
+async function tool(cg: CodeGraph, name: string, args: Record<string, unknown>): Promise<string> {
+  return (await new ToolHandler(cg).execute(name, args)).content[0]!.text;
 }
 
 async function indexed(files: Record<string, string> = {}): Promise<CodeGraph> {
@@ -231,6 +237,48 @@ describe('Supabase client calls', () => {
     }
   });
 
+  it('binds a client to the scope that declares it, a parameter or inner declaration of the name shadows it, and a client-typed parameter is one', async () => {
+    const cg = await indexed({
+      ...SCHEMA,
+      'src/shadow.ts': [
+        "import { createClient, type SupabaseClient } from '@supabase/supabase-js';",
+        'const db = createClient(URL, KEY);',
+        'export function makesOne() {',
+        '  const supabase = createClient(URL, KEY);',
+        "  return supabase.from('orders').select();",
+        '}',
+        'export function shadowed(supabase: Other) {',
+        "  return supabase.from('orders').insert({ total: 1 });",
+        '}',
+        'export function outsideItsScope() {',
+        "  return supabase.from('orders').delete();",
+        '}',
+        'export function moduleClient() {',
+        "  return db.from('orders').update({ note: 'x' });",
+        '}',
+        'export function paramShadows(db: Other) {',
+        "  return db.from('orders').delete();",
+        '}',
+        'export function localShadows() {',
+        '  const db = makeOther();',
+        "  return db.rpc('create_order');",
+        '}',
+        'export function typedParam(client: SupabaseClient) {',
+        "  return client.from('orders').delete();",
+        '}',
+      ].join('\n'),
+    });
+    try {
+      expect(dbEdges(cg)).toEqual([
+        "makesOne -references-> public::orders {op=select ops=select} supabase .from('orders').select @5",
+        "moduleClient -references-> public::orders {op=update ops=update columns=note} supabase .from('orders').update @14",
+        "typedParam -references-> public::orders {op=delete ops=delete} supabase .from('orders').delete @24",
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('links a call only to the schema of a project that contains it when several define the name, and never from sample code', async () => {
     const client = "import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(URL, KEY);\n";
     const cg = await indexed({
@@ -252,6 +300,40 @@ describe('Supabase client calls', () => {
 });
 
 describe('Supabase client calls in a monorepo', () => {
+  it('does not link a sibling project to the one schema another project holds', async () => {
+    const cg = await indexed({
+      'examples/with-nextjs/package.json': '{ "name": "with-nextjs" }\n',
+      'examples/with-nextjs/supabase/migrations/001_init.sql': 'CREATE TABLE articles (id int);\n',
+      'examples/with-workers/package.json': '{ "name": "with-workers", "dependencies": { "@supabase/supabase-js": "^2" } }\n',
+      'examples/with-workers/src/articles.ts':
+        "import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(URL, KEY);\n" +
+        "export function list() {\n  return supabase.from('articles').select();\n}\n",
+    });
+    try {
+      expect(dbEdges(cg)).toEqual([]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('links a package to the schema of a workspace package it depends on', async () => {
+    const cg = await indexed({
+      'shared/schema/package.json': '{ "name": "@acme/schema" }\n',
+      'shared/schema/supabase/migrations/001_init.sql': 'CREATE TABLE todos (id int);\n',
+      'apps/web/package.json': '{ "name": "web", "dependencies": { "@acme/schema": "workspace:*" } }\n',
+      'apps/web/lib/todos.ts':
+        "import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(URL, KEY);\n" +
+        "export function list() {\n  return supabase.from('todos').select();\n}\n",
+    });
+    try {
+      expect(dbEdges(cg)).toEqual([
+        "list -references-> public::todos {op=select ops=select} supabase .from('todos').select @4",
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('links app code to the one schema a package holds, through a one-line template name', async () => {
     const cg = await indexed({
       'packages/db/supabase/migrations/001_init.sql': 'CREATE TABLE todos (id int);\n',
@@ -266,6 +348,45 @@ describe('Supabase client calls in a monorepo', () => {
     } finally {
       cg.destroy();
     }
+  });
+});
+
+describe('a function that performs several ops on one table', () => {
+  it('shows every op on callers, impact, the node trail and the table block', async () => {
+    const cg = await indexed({
+      'supabase/migrations/001_schema.sql':
+        'CREATE TABLE orders (id bigint, status text);\n' +
+        'CREATE FUNCTION on_delete() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n  RETURN OLD;\nEND;\n$$;\n' +
+        'CREATE TRIGGER orders_deleted AFTER DELETE ON orders FOR EACH ROW EXECUTE FUNCTION on_delete();\n',
+      'src/orders.ts':
+        "import { createClient } from '@supabase/supabase-js';\nconst supabase = createClient(URL, KEY);\n" +
+        'export async function folded(id: number) {\n' +
+        "  await supabase.from('orders').select('id').eq('id', id);\n" +
+        "  await supabase.from('orders').update({ status: 'x' }).eq('id', id);\n" +
+        "  await supabase.from('orders').delete().eq('id', id);\n}\n",
+    });
+    try {
+      expect(await tool(cg, 'codegraph_callers', { symbol: 'public::orders' })).toBe(
+        '**Callers of public::orders (1 found)**\n\n- folded (function) - src/orders.ts:5 — via select, update, delete',
+      );
+      expect(await tool(cg, 'codegraph_impact', { symbol: 'public::orders', depth: 1 })).toContain(
+        '**src/orders.ts:**\nfolded:3 [select, update, delete]',
+      );
+      const table = await tool(cg, 'codegraph_node', { symbol: 'public::orders' });
+      expect(table).toContain([
+        '- update: folded (src/orders.ts:3)',
+        '- delete: folded (src/orders.ts:3) fires orders_deleted',
+      ].join('\n'));
+      expect(table).toContain(
+        "**Called by ←** folded (src/orders.ts:5) [dynamic: supabase `.from('orders').update` @src/orders.ts:5]",
+      );
+    } finally {
+      cg.close();
+    }
+    const cli = spawnSync(process.execPath, [BIN, 'callers', 'public::orders'], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, CODEGRAPH_TELEMETRY: '0', NO_COLOR: '1' },
+    });
+    expect(cli.stdout).toContain('function    folded [select, update, delete]\n  src/orders.ts:5\n');
   });
 });
 
@@ -376,6 +497,29 @@ describe('the postgres-ts fixture', () => {
     return text.slice(start, text.indexOf('\n\n', text.indexOf('1. ', start)));
   }
 
+  it('keeps the file of every hop of a SQL flow under the file cap, after the table write path', async () => {
+    fs.cpSync(FIXTURE, dir, { recursive: true });
+    const cg = await indexed({
+      'api/createOrderReport.ts': 'export function createOrderReport() {\n  return createOrderSummary();\n}\nexport function createOrderSummary() {\n  return 1;\n}\n',
+      'api/createOrderForm.ts': 'export function createOrderForm() {\n  return createOrderFormState();\n}\nexport function createOrderFormState() {\n  return 2;\n}\n',
+      'api/createOrderEmail.ts': 'export function createOrderEmail() {\n  return createOrderEmailBody();\n}\nexport function createOrderEmailBody() {\n  return 3;\n}\n',
+    });
+    try {
+      const text = await tool(cg, 'codegraph_explore', {
+        query: 'createOrderHandler create_order log_order_insert createOrderReport createOrderForm createOrderEmail',
+      });
+      const source = text.slice(text.indexOf('**Source Code**'));
+      expect([...source.matchAll(/^\*\*`([^`]+)`\*\*/gm)].map((m) => m[1])).toEqual([
+        'supabase/migrations/004_audit.sql',
+        'supabase/migrations/002_functions.sql',
+        'api/orders.ts',
+        'supabase/migrations/001_schema.sql',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('runs from each API handler through SQL to the trigger function its write fires', async () => {
     fs.cpSync(FIXTURE, dir, { recursive: true });
     const cg = await indexed();
@@ -384,7 +528,7 @@ describe('the postgres-ts fixture', () => {
         '**Flow (call path among the symbols you queried)**',
         '',
         '1. createOrderHandler (api/orders.ts:3)',
-        "   ↓ dynamic: supabase `.schema('app').rpc('create_order')` @supabase/migrations/002_functions.sql:18",
+        "   ↓ dynamic: supabase `.schema('app').rpc('create_order')` @api/orders.ts:4",
         '2. create_order (supabase/migrations/002_functions.sql:18)',
         '   ↓ insert into `orders`',
         '3. orders (supabase/migrations/001_schema.sql:26)',
@@ -395,7 +539,7 @@ describe('the postgres-ts fixture', () => {
         '**Flow (call path among the symbols you queried)**',
         '',
         '1. cancelOrderHandler (api/orders.ts:12)',
-        "   ↓ dynamic: supabase `.from('orders').update` @supabase/migrations/001_schema.sql:26",
+        "   ↓ dynamic: supabase `.from('orders').update` @api/orders.ts:14",
         '2. orders (supabase/migrations/001_schema.sql:26)',
         '   ↓ dynamic: trigger `orders_touch` BEFORE UPDATE ON `orders` @supabase/migrations/002_functions.sql:9',
         '3. touch_updated_at (supabase/migrations/002_functions.sql:1)',

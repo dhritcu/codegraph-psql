@@ -36,17 +36,29 @@ export function sqlEdgeOp(edge: Edge | null | undefined): string | null {
   return edge?.kind === 'references' && typeof op === 'string' && SQL_OPS.has(op) ? op : null;
 }
 
+/**
+ * Every operation an edge into a table performs. A client edge folds all of a
+ * function's accesses to one table into `metadata.ops`; `op` is only the one
+ * its trigger hop starts from.
+ */
+export function sqlEdgeOpList(edge: Edge | null | undefined): string[] {
+  const op = sqlEdgeOp(edge);
+  if (!op) return [];
+  const ops = (edge!.metadata as { ops?: unknown }).ops;
+  const listed = Array.isArray(ops) ? ops.filter((o): o is string => typeof o === 'string' && SQL_OPS.has(o)) : [];
+  return listed.length > 0 ? [...new Set(listed)] : [op];
+}
+
 /** The distinct operations a set of edges performs, in first-seen order. */
 export function sqlEdgeOps(edges: readonly Edge[]): string[] {
-  return [...new Set(edges.map(sqlEdgeOp).filter((op): op is string => op !== null))];
+  return [...new Set(edges.flatMap(sqlEdgeOpList))];
 }
 
 /** For each node among `edges` that accesses a table, the ` [insert, select]` tag its line carries. */
 export function sqlOpTags(edges: Iterable<Edge>): Map<string, string> {
   const ops = new Map<string, Set<string>>();
   for (const edge of edges) {
-    const op = sqlEdgeOp(edge);
-    if (op) ops.set(edge.source, (ops.get(edge.source) ?? new Set()).add(op));
+    for (const op of sqlEdgeOpList(edge)) ops.set(edge.source, (ops.get(edge.source) ?? new Set()).add(op));
   }
   return new Map([...ops].map(([id, set]) => [id, ` [${[...set].join(', ')}]`]));
 }
@@ -457,8 +469,7 @@ export function writePathTables(cg: CodeGraph, node: Node): Node[] {
   const ids = cg.getOutgoingEdges(node.id)
     .filter((e) => {
       if (isTrigger(node)) return e.kind === 'references';
-      const op = sqlEdgeOp(e);
-      return op !== null && op !== 'select';
+      return sqlEdgeOpList(e).some((op) => op !== 'select');
     })
     .map((e) => e.target);
   if (isTrigger(node)) ids.push(...cg.getIncomingEdges(node.id).filter((e) => e.kind === 'contains').map((e) => e.source));
@@ -509,25 +520,29 @@ export function sqlTableWritePath(cg: CodeGraph, table: Node): SqlWritePath | nu
   const liveNames = new Set(live.map((t) => t.node.qualifiedName));
   const byOp = new Map<string, Map<string, Edge[]>>();
   for (const edge of incoming) {
-    const op = sqlEdgeOp(edge);
-    if (!op || op === 'select') continue;
-    const writers = byOp.get(op) ?? new Map<string, Edge[]>();
-    writers.set(edge.source, [...(writers.get(edge.source) ?? []), edge]);
-    byOp.set(op, writers);
+    for (const op of sqlEdgeOpList(edge)) {
+      if (op === 'select') continue;
+      const writers = byOp.get(op) ?? new Map<string, Edge[]>();
+      writers.set(edge.source, [...(writers.get(edge.source) ?? []), edge]);
+      byOp.set(op, writers);
+    }
   }
   const writerIds = [...new Set([...byOp.values()].flatMap((writers) => [...writers.keys()]))];
   const writerNodes = cg.getNodesByIds(writerIds);
+  // Keyed by writer and op: a function that updates and deletes a table fires its delete triggers on the delete row only.
   const firedBy = new Map<string, string[]>();
   for (const e of cg.getOutgoingEdgesFrom(writerIds, ['calls'])) {
-    const m = e.metadata as { synthesizedBy?: unknown; trigger?: unknown } | undefined;
+    const m = e.metadata as { synthesizedBy?: unknown; trigger?: unknown; event?: unknown } | undefined;
     if (m?.synthesizedBy !== 'pg-trigger' || !liveNames.has(String(m.trigger))) continue;
-    firedBy.set(e.source, [...(firedBy.get(e.source) ?? []), String(m.trigger).split('::').pop()!]);
+    const key = `${e.source}:${typeof m.event === 'string' ? m.event : ''}`;
+    firedBy.set(key, [...(firedBy.get(key) ?? []), String(m.trigger).split('::').pop()!]);
   }
   for (const op of [...SQL_OPS].filter((o) => byOp.has(o))) {
     const writers = byOp.get(op)!;
     const nodes = liveSqlDefinitions(cg, [...writers.keys()].map((id) => writerNodes.get(id)).filter((n): n is Node => !!n), drops).nodes;
     const entries = nodes.flatMap((writer) => {
-      const fires = [...new Set(firedBy.get(writer.id) ?? [])];
+      const events = op === 'merge' ? ['insert', 'update', 'delete', ''] : [op, ''];
+      const fires = [...new Set(events.flatMap((event) => firedBy.get(`${writer.id}:${event}`) ?? []))];
       const firing = fires.length > 0 ? ` fires ${fires.join(', ')}` : '';
       if (writer.kind === 'file') return topLevelWrites(cg, writer, writers.get(writer.id) ?? []).map((w) => `${w}${firing}`);
       const drop = droppedWith(cg, drops, writer);

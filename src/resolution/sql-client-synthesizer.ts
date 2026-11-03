@@ -24,9 +24,12 @@
  * from `@supabase/supabase-js`, `createServerClient` / `createBrowserClient`
  * from `@supabase/ssr`, `knex` from `knex`, `new Kysely` from `kysely`), or
  * from a function of the file whose body calls that factory (`const s = await
- * createClient()`). Either may come from one project module away: an import
- * is followed one hop to the module that makes the client, no further. Any
- * other `.from('orders')` makes no edge.
+ * createClient()`), or it is a parameter typed as the client (`db:
+ * SupabaseClient`). Either may come from one project module away: an import
+ * is followed one hop to the module that makes the client, no further. A
+ * binding holds in the scope that declares it, the function or the module,
+ * and a parameter or declaration of the same name in a function inside that
+ * scope shadows it. Any other `.from('orders')` makes no edge.
  *
  * Edges: a table access is `references` with `metadata.op` (select / insert /
  * update / delete), an rpc is `calls`. One edge per function and table; when
@@ -34,7 +37,8 @@
  * write (else select) as `op` and all of them as `ops`. An upsert is
  * `op: 'insert'` with `upsert: true` and `ops: ['insert', 'update']`: it fires
  * the table's INSERT and UPDATE triggers. An update's or upsert's `columns`
- * are the keys of its literal payload object.
+ * are the keys of its literal payload object. `registeredAt` is the call
+ * site, the target's own location being the definition.
  *
  * Synthesized edges persist only after every pass has run, so the trigger
  * pass cannot see these writes. This pass runs it over its own writes, one
@@ -49,7 +53,7 @@ import { stripCommentsForRegex } from './strip-comments';
 import { resolveImportPath } from './import-resolver';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { isTestPath } from '../search/query-utils';
-import { enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
+import { enclosingFn, enclosingValue, FN_KINDS, makeLineAt } from './synth-utils';
 import { postgresResolver } from './frameworks/postgres';
 import { qualify, DEFAULT_SCHEMA } from '../extraction/languages/postgres-names';
 import { pgTriggerEdges } from './pg-trigger-synthesizer';
@@ -73,6 +77,13 @@ const FACTORIES: Readonly<Record<Exclude<Client, 'drizzle'>, { packages: Record<
   },
   knex: { packages: { knex: ['default', 'knex', 'Knex'] }, isNew: false },
   kysely: { packages: { kysely: ['Kysely'] }, isNew: true },
+};
+
+/** The type of a client instance, by the package that exports it: a parameter annotated with one is a client. */
+const CLIENT_TYPES: Readonly<Record<string, Readonly<Record<string, Binding['client']>>>> = {
+  '@supabase/supabase-js': { SupabaseClient: 'supabase' },
+  knex: { Knex: 'knex' },
+  kysely: { Kysely: 'kysely' },
 };
 
 const DRIZZLE_PACKAGE = 'drizzle-orm/pg-core';
@@ -233,11 +244,20 @@ interface Binding {
   schema: string | null;
 }
 
+/** A name bound to a client in one scope: the function that declares it, or the module (null). */
+interface Scoped {
+  binding: Binding;
+  scope: Node | null;
+}
+
 interface FileFacts {
   file: string;
   safe: string;
-  /** Local names bound to a client instance. */
-  instances: Map<string, Binding>;
+  lines: string[];
+  nodes: Node[];
+  lineOf: (index: number) => number;
+  /** Local names bound to a client instance, each binding with the scope it is declared in. */
+  instances: Map<string, Scoped[]>;
   /** Local functions whose body makes a client and returns it. */
   factories: Map<string, Binding>;
   /** What `export default` is, when it is one of the above. */
@@ -306,21 +326,21 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   if (!content) return null;
   const safe = blankTemplates(stripCommentsForRegex(content, 'typescript'));
   const imports = importsOf(ctx, file, safe).filter((im) => safe.includes(`'${im.source}'`) || safe.includes(`"${im.source}"`));
-  const instances = new Map<string, Binding>();
+  const instances = new Map<string, Scoped[]>();
   const factories = new Map<string, Binding>();
   const calls = factoryCalls(safe, imports);
+  const lineOf = makeLineAt(safe, 1);
+  const nodes = ctx.getNodesInFile(file);
   if (calls.length > 0) {
-    const lineOf = makeLineAt(safe, 1);
     const lineStarts = [0];
     for (let i = safe.indexOf('\n'); i !== -1; i = safe.indexOf('\n', i + 1)) lineStarts.push(i + 1);
-    const nodes = ctx.getNodesInFile(file);
     const bound = new RegExp(String.raw`(?:\b(?:const|let|var)\s+)?(?<![\w$.])(${IDENT})\s*(?::[^=;]*?)?=\s*(?:await\s+)?$`);
     const returned = /(?:\breturn|=>)\s*(?:await\s+)?$/;
     for (const call of calls) {
       const before = safe.slice(Math.max(0, call.index - 200), call.index);
       const name = bound.exec(before)?.[1];
-      if (name) instances.set(name, call.binding);
       const fn = enclosingFn(nodes, lineOf(call.index));
+      if (name) bind(instances, name, { binding: call.binding, scope: fn });
       if (!fn) continue;
       const body = safe.slice(lineStarts[fn.startLine - 1] ?? 0, lineStarts[fn.endLine] ?? safe.length);
       if (returned.test(before) || (name && new RegExp(String.raw`\breturn\s+${escape(name)}\s*(?:;|\}|$)`, 'm').test(body))) {
@@ -332,10 +352,52 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   const requiredCall = new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)\s*\(`, 'g');
   for (const m of safe.matchAll(requiredCall)) {
     const client = factoryClient([{ localName: m[1]!, exportedName: 'default', source: m[3]!, isDefault: true, isNamespace: false }], m[1]!);
-    if (client && !FACTORIES[client].isNew) instances.set(m[1]!, { client, schema: null });
+    if (client && !FACTORIES[client].isNew) bind(instances, m[1]!, { binding: { client, schema: null }, scope: enclosingFn(nodes, lineOf(m.index!)) });
+  }
+  const types = new Map<string, Binding['client']>();
+  for (const im of imports) {
+    const client = CLIENT_TYPES[packageOf(im.source)]?.[im.exportedName];
+    if (client && !im.isDefault) types.set(im.localName, client);
+  }
+  if (types.size > 0) {
+    const typed = new RegExp(String.raw`(?<![\w$.])(${IDENT})\s*\??\s*:\s*(${[...types.keys()].map(escape).join('|')})(?![\w$])`, 'g');
+    for (const fn of nodes) {
+      if (!FN_KINDS.has(fn.kind) || !fn.signature) continue;
+      for (const m of fn.signature.matchAll(typed)) bind(instances, m[1]!, { binding: { client: types.get(m[2]!)!, schema: null }, scope: fn });
+    }
   }
   const def = new RegExp(String.raw`\bexport\s+default\s+(${IDENT})\s*;?\s*$`, 'm').exec(safe);
-  return { file, safe, instances, factories, defaultExport: def ? { name: def[1]! } : null, imports };
+  return { file, safe, lines: safe.split('\n'), nodes, lineOf, instances, factories, defaultExport: def ? { name: def[1]! } : null, imports };
+}
+
+function bind(instances: Map<string, Scoped[]>, name: string, scoped: Scoped): void {
+  instances.set(name, [...(instances.get(name) ?? []), scoped]);
+}
+
+const moduleBinding = (instances: Map<string, Scoped[]>, name: string): Binding | undefined =>
+  instances.get(name)?.find((b) => b.scope === null)?.binding;
+
+/** Whether a function's parameters or its own declarations bind `name`. */
+function declares(facts: FileFacts, fn: Node, name: string): boolean {
+  const n = escape(name);
+  const param = new RegExp(String.raw`(?<![\w$.])${n}\s*[?:,)=]`);
+  const lines = facts.lines.slice(fn.startLine - 1, fn.endLine ?? fn.startLine).join('\n');
+  const params = fn.signature?.split(/\)\s*(?::|=>|$)/)[0] ?? lines.split(/\{|=>/)[0]!;
+  if (param.test(params)) return true;
+  return new RegExp(String.raw`\b(?:const|let|var)\s+${n}(?![\w$])|\b(?:const|let|var)\s*\{[^}]*(?<![\w$.])${n}\s*[,}=]`).test(lines);
+}
+
+/**
+ * Whether a name bound in `scope` still means that binding on `line`: the line
+ * is inside the scope, and no function between the two binds the name again.
+ */
+function visible(facts: FileFacts, name: string, scope: Node | null, line: number): boolean {
+  const within = (n: Node, l: number) => n.startLine <= l && (n.endLine ?? n.startLine) >= l;
+  if (scope && !within(scope, line)) return false;
+  return !facts.nodes.some((fn) =>
+    FN_KINDS.has(fn.kind) && fn.id !== scope?.id && within(fn, line) &&
+    (!scope || (within(scope, fn.startLine) && within(scope, fn.endLine ?? fn.startLine))) &&
+    declares(facts, fn, name));
 }
 
 type FactsCache = Map<string, FileFacts | null>;
@@ -349,17 +411,24 @@ function factsOf(ctx: ResolutionContext, file: string, cache: FactsCache): FileF
   return facts;
 }
 
+interface Receiver {
+  /** The receiver as a regex source: `supabase`, or a factory call `getClient\s*\(\s*\)`. */
+  pattern: string;
+  binding: Binding;
+  /** The instance name and the scope it is bound in; null for a factory call. */
+  bound: { name: string; scope: Node | null } | null;
+}
+
 /**
- * The receivers a file can query through, as regex sources: the client
- * instances and factory calls (`supabaseAdmin()`) of its own, and of the
- * module it imports them from.
+ * The receivers a file can query through: the client instances and factory
+ * calls (`supabaseAdmin()`) of its own, and of the module it imports them from.
  */
-function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Map<string, Binding> {
-  const instances = new Map(facts.instances);
+function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Receiver[] {
+  const instances = new Map([...facts.instances].map(([name, list]) => [name, [...list]]));
   const factories = new Map(facts.factories);
   const lang = facts.file.endsWith('x') ? 'tsx' : 'typescript';
   for (const im of facts.imports) {
-    if (im.isNamespace || instances.has(im.localName) || factories.has(im.localName)) continue;
+    if (im.isNamespace || moduleBinding(instances, im.localName) || factories.has(im.localName)) continue;
     if (!im.source.startsWith('.') && !im.resolvedPath && !/^[@~#]\//.test(im.source)) continue;
     const resolved = im.resolvedPath ?? resolveImportPath(im.source, facts.file, lang, ctx);
     if (!resolved || !JS_FILE.test(resolved)) continue;
@@ -367,9 +436,9 @@ function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache):
     if (!there) continue;
     const exported = im.isDefault ? there.defaultExport?.name : im.exportedName;
     if (!exported) continue;
-    const instance = there.instances.get(exported);
+    const instance = moduleBinding(there.instances, exported);
     const factory = there.factories.get(exported);
-    if (instance) instances.set(im.localName, instance);
+    if (instance) bind(instances, im.localName, { binding: instance, scope: null });
     else if (factory) factories.set(im.localName, factory);
   }
   // `const supabase = await createClient()` — an instance made by a factory.
@@ -377,13 +446,14 @@ function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache):
     const call = new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*(?::[^=;]*?)?=\s*(?:await\s+)?(${IDENT})\s*\(`, 'g');
     for (const m of facts.safe.matchAll(call)) {
       const binding = factories.get(m[2]!);
-      if (binding && !instances.has(m[1]!)) instances.set(m[1]!, binding);
+      const scope = enclosingFn(facts.nodes, facts.lineOf(m.index!));
+      if (binding && !instances.get(m[1]!)?.some((b) => b.scope?.id === scope?.id)) bind(instances, m[1]!, { binding, scope });
     }
   }
-  return new Map([
-    ...[...instances].map(([name, b]) => [escape(name), b] as const),
-    ...[...factories].map(([name, b]) => [String.raw`${escape(name)}\s*\(\s*\)`, b] as const),
-  ]);
+  return [
+    ...[...instances].flatMap(([name, list]) => list.map(({ binding, scope }) => ({ pattern: escape(name), binding, bound: { name, scope } }))),
+    ...[...factories].map(([name, binding]) => ({ pattern: String.raw`${escape(name)}\s*\(\s*\)`, binding, bound: null })),
+  ];
 }
 
 // =============================================================================
@@ -534,10 +604,12 @@ function drizzleSites(facts: FileFacts, out: Site[]): void {
 
 function sitesIn(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Site[] {
   const sites: Site[] = [];
-  for (const [receiver, binding] of receivers(ctx, facts, cache)) {
-    if (binding.client === 'supabase') supabaseSites(facts.safe, receiver, binding, sites);
-    else if (binding.client === 'knex') knexSites(facts.safe, receiver, sites);
-    else kyselySites(facts.safe, receiver, sites);
+  for (const { pattern, binding, bound } of receivers(ctx, facts, cache)) {
+    const found: Site[] = [];
+    if (binding.client === 'supabase') supabaseSites(facts.safe, pattern, binding, found);
+    else if (binding.client === 'knex') knexSites(facts.safe, pattern, found);
+    else kyselySites(facts.safe, pattern, found);
+    sites.push(...(bound ? found.filter((site) => visible(facts, bound.name, bound.scope, facts.lineOf(site.index))) : found));
   }
   if (facts.safe.includes(DRIZZLE_PACKAGE)) drizzleSites(facts, sites);
   return sites;
@@ -573,16 +645,63 @@ function projectRoot(series: string, isFile: boolean): string {
   return parts.join('/');
 }
 
+interface Package {
+  dir: string;
+  name: string | null;
+  dependencies: ReadonlySet<string>;
+}
+
+type PackageCache = Map<string, Package | null>;
+
+const dirOf = (file: string): string => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '');
+
+/** The package.json nearest at or above `dir`, the repo root's included; null when there is none. */
+function packageAt(ctx: ResolutionContext, dir: string, cache: PackageCache): Package | null {
+  let pkg = cache.get(dir);
+  if (pkg !== undefined) return pkg;
+  const text = ctx.readFile(dir === '' ? 'package.json' : `${dir}/package.json`);
+  if (text === null) {
+    pkg = dir === '' ? null : packageAt(ctx, dirOf(dir), cache);
+  } else {
+    let json: Record<string, unknown> = {};
+    try {
+      json = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      // A package.json that does not parse names no package and no dependencies.
+    }
+    const deps = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+      .flatMap((k) => (json[k] && typeof json[k] === 'object' ? Object.keys(json[k] as object) : []));
+    pkg = { dir, name: typeof json.name === 'string' ? json.name : null, dependencies: new Set(deps) };
+  }
+  cache.set(dir, pkg);
+  return pkg;
+}
+
+/**
+ * Whether code in `fromFile` may use a schema whose project sits elsewhere:
+ * its package is one the caller's package depends on, or a database package
+ * of the workspace (`packages/db`, `packages/supabase`). Sibling apps and
+ * examples that merely share a repo do not share a database.
+ */
+function sharesSchema(ctx: ResolutionContext, root: string, fromFile: string, packages: PackageCache): boolean {
+  const parts = root.split('/');
+  if (parts.includes('packages') && /^(?:[\w.]+[-_.])?(?:db|database|supabase)(?:[-_.][\w.]+)?$/i.test(parts[parts.length - 1]!)) return true;
+  const schema = packageAt(ctx, root, packages);
+  const caller = packageAt(ctx, dirOf(fromFile), packages);
+  return !!schema?.name && !!caller && schema.dir !== caller.dir && caller.dependencies.has(schema.name);
+}
+
 /**
  * The SQL object a client call names, as the database has it once every
  * migration ran. A repo may hold several schemas (an app per directory): then a
  * definition counts only when its project directory contains the calling
  * file, the deepest such project wins, and two series or files of equal depth
- * make the name ambiguous and yield nothing. Within one series the
- * Postgres resolver picks the live definition, asked from a position after
- * the series' last migration.
+ * make the name ambiguous and yield nothing. A repo's only schema also counts
+ * from outside its project when the caller's package shares it
+ * (`sharesSchema`). Within one series the Postgres resolver picks the live
+ * definition, asked from a position after the series' last migration.
  */
-function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: string): Node | null {
+function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: string, packages: PackageCache): Node | null {
   const qualifiedName = qualify({ schema: target.schema, name: target.name });
   const defs = ctx.getNodesByQualifiedName(qualifiedName).filter((n) => SQL_LANGUAGES.has(n.language) && n.kind === TARGET_KIND[target.kind]);
   if (defs.length === 0) return null;
@@ -592,8 +711,7 @@ function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: stri
   for (const d of defs) {
     const series = seriesOf(d.filePath);
     const root = projectRoot(series, series === d.filePath);
-    // One schema in the repo is the app's, wherever its package sits.
-    if (root !== '' && !fromFile.startsWith(`${root}/`) && all.size > 1) continue;
+    if (root !== '' && !fromFile.startsWith(`${root}/`) && (all.size > 1 || !sharesSchema(ctx, root, fromFile, packages))) continue;
     const depth = root === '' ? 0 : root.split('/').length;
     if (depth > best) {
       best = depth;
@@ -642,7 +760,7 @@ function hopEdge(from: Node, site: Site, target: Node, line: number, column: num
       ...(site.ops.length > 0 ? { op: write ?? site.ops[0], ops: [...site.ops] } : {}),
       ...(site.upsert ? { upsert: true } : {}),
       ...(site.columns ? { columns: [...site.columns] } : {}),
-      registeredAt: `${target.filePath}:${target.startLine}`,
+      registeredAt: `${from.filePath}:${line}`,
     },
   };
 }
@@ -651,7 +769,7 @@ function hopEdge(from: Node, site: Site, target: Node, line: number, column: num
  * Fold a later site's ops and columns into the edge an earlier site on the
  * same pair made. The edge sits at its first write, where a trigger hop starts.
  */
-function mergeSite(edge: Edge, site: Site, line: number, column: number): void {
+function mergeSite(edge: Edge, site: Site, file: string, line: number, column: number): void {
   const m = edge.metadata as Record<string, unknown>;
   const ops = new Set([...((m.ops as Op[] | undefined) ?? []), ...site.ops]);
   if (ops.size === 0) return;
@@ -660,6 +778,7 @@ function mergeSite(edge: Edge, site: Site, line: number, column: number): void {
   if (write && (!m.op || m.op === 'select')) {
     m.op = write;
     m.call = site.call;
+    m.registeredAt = `${file}:${line}`;
     edge.line = line;
     edge.column = column;
   }
@@ -696,6 +815,7 @@ export async function sqlClientEdges(queries: QueryBuilder, ctx: ResolutionConte
   const edges: Edge[] = [];
   const byPair = new Map<string, Edge>();
   const targets = new Map<string, Node | null>();
+  const packages: PackageCache = new Map();
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
     if (!JS_FILE.test(file) || isTestPath(file) || isGeneratedFile(file)) continue;
@@ -715,7 +835,7 @@ export async function sqlClientEdges(queries: QueryBuilder, ctx: ResolutionConte
       const key = `${site.target.kind}:${site.target.schema}.${site.target.name}@${file}`;
       let target = targets.get(key);
       if (target === undefined) {
-        target = resolveTarget(ctx, site.target, file);
+        target = resolveTarget(ctx, site.target, file, packages);
         targets.set(key, target);
       }
       if (!target) continue;
@@ -723,7 +843,7 @@ export async function sqlClientEdges(queries: QueryBuilder, ctx: ResolutionConte
       const seen = byPair.get(pair);
       const column = site.index - (facts.safe.lastIndexOf('\n', site.index - 1) + 1);
       if (seen) {
-        mergeSite(seen, site, line, column);
+        mergeSite(seen, site, file, line, column);
         continue;
       }
       const edge = hopEdge(from, site, target, line, column);

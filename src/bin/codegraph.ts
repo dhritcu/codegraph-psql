@@ -71,7 +71,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
-import { sqlCallerRows, sqlEdgeOp, sqlEdgeOps, sqlOpTags } from '../graph/sql-surface';
+import { sqlCallerRows, sqlEdgeOpList, sqlEdgeOps, sqlOpTags } from '../graph/sql-surface';
 import { goPackageReaderFor } from '../graph/go-package';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import { buildTypeHierarchy, canHaveHierarchy, MAX_DESCENDANTS, MAX_DESCENDANT_DEPTH } from '../graph/type-hierarchy';
@@ -2641,7 +2641,7 @@ for (const direction of ['callers', 'callees'] as const) {
               }
               for (const node of limited) {
                 // A table access reads as its operation (`insert`), not as a bare reference.
-                const kinds = [...new Set(ownEdges(node, edges).map((edge) => sqlEdgeOp(edge) ?? edge.kind))]
+                const kinds = [...new Set(ownEdges(node, edges).flatMap((edge) => { const ops = sqlEdgeOpList(edge); return ops.length > 0 ? ops : [edge.kind]; }))]
                   .filter((kind) => kind !== 'calls');
                 const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
                 const itself = recursive.has(node.id) ? ' (calls itself)' : '';
