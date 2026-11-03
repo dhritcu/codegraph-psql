@@ -174,11 +174,9 @@ describe('a SQL table\'s write path, complete enough to stop reading migrations'
     });
     try {
       const text = await explore(cg, 'objects_delete_cleanup trigger on storage.objects delete');
-      expect(sourceFiles(text)).toEqual([
-        'migrations/tenant/0001-objects.sql',
+      expect(sourceFiles(text).slice(0, 2)).toEqual([
         'migrations/tenant/0006-protect.sql',
         'migrations/tenant/0008-lifecycle.sql',
-        'src/storage/objects.ts',
       ]);
       expect(text).toContain([
         '> Not printed, because a later migration dropped or redefined them and their bodies no longer run:',
@@ -189,6 +187,27 @@ describe('a SQL table\'s write path, complete enough to stop reading migrations'
       expect(text).toContain("3\t  IF current_setting('storage.allow_delete_query', true) <> 'true' THEN");
       expect(text).toContain('4\t  DELETE FROM storage.objects WHERE id = ANY(ids);');
       expect(text).not.toContain('8\t  PERFORM storage.delete_leaf_prefixes(ARRAY[]::text[]);');
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('leads with the live write path when the Flow through the table no longer runs', async () => {
+    const cg = await indexed({
+      ...STORAGE,
+      'src/storage/objects.ts':
+        'export function deleteObjects(ids: string[]) {\n  return remove(ids);\n}\n' +
+        'export function remove(ids: string[]) {\n  return ids.length;\n}\n',
+    });
+    try {
+      const text = await explore(cg, 'deleteObjects storage.objects objects_delete_cleanup delete_leaf_prefixes');
+      expect(text).toContain('> This path no longer runs once every migration applies');
+      expect(sourceFiles(text)).toEqual([
+        'migrations/tenant/0006-protect.sql',
+        'migrations/tenant/0008-lifecycle.sql',
+        'migrations/tenant/0001-objects.sql',
+        'src/storage/objects.ts',
+      ]);
     } finally {
       cg.destroy();
     }
