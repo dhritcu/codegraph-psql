@@ -38,25 +38,12 @@ import { enclosingFn, makeLineAt } from './synth-utils';
 import { getParser, loadGrammarsForLanguages } from '../extraction/grammars';
 import { sqlTreeRefs, type BodyRef, type SqlOp } from '../extraction/languages/postgres-bodies';
 import { splitIdentifierPath } from '../extraction/languages/postgres-names';
+import { sqlClients, type SqlTextClient } from './sql-model';
 import { closeBracket, importsOf, packageOf, resolveTarget, triggerHops, type PackageCache, type SqlTarget } from './sql-client-synthesizer';
 
-type Client = 'postgres' | 'slonik' | 'drizzle' | 'kysely' | 'pg' | 'knex' | 'prisma';
-type Made = Exclude<Client, 'prisma'>;
+type Client = SqlTextClient | 'prisma';
 
-/**
- * How each client is made and how it runs a string. `tag`: the import itself
- * is the tag. `call` / `new`: the import is a factory whose result is the
- * client. `tagged`: the client is a template tag. `methods`: the methods that
- * take SQL as their first argument.
- */
-const CLIENTS: Readonly<Record<Made, { packages: Record<string, readonly string[]>; make: 'tag' | 'call' | 'new'; tagged: boolean; methods: readonly string[] }>> = {
-  slonik: { packages: { slonik: ['sql'] }, make: 'tag', tagged: true, methods: [] },
-  drizzle: { packages: { 'drizzle-orm': ['sql'] }, make: 'tag', tagged: true, methods: [] },
-  kysely: { packages: { kysely: ['sql'] }, make: 'tag', tagged: true, methods: [] },
-  postgres: { packages: { postgres: ['default'] }, make: 'call', tagged: true, methods: ['unsafe'] },
-  pg: { packages: { pg: ['Pool', 'Client', 'default'] }, make: 'new', tagged: false, methods: ['query'] },
-  knex: { packages: { knex: ['default', 'knex', 'Knex'] }, make: 'call', tagged: false, methods: ['raw'] },
-};
+const CLIENTS = sqlClients('text');
 
 /** A module specifier with a `prisma` segment: `@prisma/client`, `@calcom/prisma`, `../generated/prisma/client`. */
 const PRISMA_MODULE = /(?:^|[/@])prisma(?:[/-]|$)/;
@@ -86,16 +73,16 @@ interface FileFacts {
   code: string;
   imports: ImportMapping[];
   /** Local names bound to a client: an instance, or a tag. */
-  instances: Map<string, Made>;
+  instances: Map<string, SqlTextClient>;
   /** Local functions whose body makes a client and returns it. */
-  factories: Map<string, Made>;
+  factories: Map<string, SqlTextClient>;
   defaultExport: string | null;
 }
 
 /** The client an import makes or is, and how. */
-function importedClient(im: ImportMapping): Made | null {
+function importedClient(im: ImportMapping): SqlTextClient | null {
   const pkg = packageOf(im.source);
-  for (const [client, c] of Object.entries(CLIENTS) as [Made, (typeof CLIENTS)[Made]][]) {
+  for (const [client, c] of CLIENTS) {
     if (c.packages[pkg]?.includes(im.isDefault || im.isNamespace ? 'default' : im.exportedName)) return client;
   }
   return null;
@@ -109,15 +96,15 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   if (!content) return null;
   const code = stripCommentsForRegex(content, 'typescript');
   const imports = importsOf(ctx, file, code).filter((im) => code.includes(`'${im.source}'`) || code.includes(`"${im.source}"`));
-  const instances = new Map<string, Made>();
-  const factories = new Map<string, Made>();
+  const instances = new Map<string, SqlTextClient>();
+  const factories = new Map<string, SqlTextClient>();
   const nodes = ctx.getNodesInFile(file);
   const lineOf = makeLineAt(code, 1);
   const lines = code.split('\n');
   for (const im of imports) {
     const client = importedClient(im);
     if (!client) continue;
-    const { make } = CLIENTS[client];
+    const { make } = CLIENTS.get(client)!;
     if (make === 'tag') {
       instances.set(im.localName, client);
       continue;
@@ -139,7 +126,7 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   // `const knex = require('knex')({ client: 'pg' })`: the factory called where it is required.
   for (const m of code.matchAll(new RegExp(String.raw`\b(?:const|let|var)\s+(${IDENT})\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)\s*\(`, 'g'))) {
     const client = importedClient({ localName: m[1]!, exportedName: 'default', source: m[3]!, isDefault: true, isNamespace: false });
-    if (client && CLIENTS[client].make === 'call') instances.set(m[1]!, client);
+    if (client && CLIENTS.get(client)!.make === 'call') instances.set(m[1]!, client);
   }
   const def = new RegExp(String.raw`\bexport\s+default\s+(${IDENT})\s*;?\s*$`, 'm').exec(code);
   return { file, code, imports, instances, factories, defaultExport: def?.[1] ?? null };
@@ -157,7 +144,7 @@ function factsOf(ctx: ResolutionContext, file: string, cache: FactsCache): FileF
 }
 
 /** The receivers of a file, as regex sources: its own clients and those of the modules it imports them from. */
-function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Map<string, Made> {
+function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Map<string, SqlTextClient> {
   const instances = new Map(facts.instances);
   const factories = new Map(facts.factories);
   const lang = facts.file.endsWith('x') ? 'tsx' : 'typescript';
@@ -281,10 +268,10 @@ function prismaCandidates(facts: FileFacts, out: Candidate[]): void {
 function candidatesIn(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache): Candidate[] {
   const out: Candidate[] = [];
   const recv = receivers(ctx, facts, cache);
-  const tagSources = [...recv].filter(([, c]) => CLIENTS[c].tagged).map(([r]) => r);
+  const tagSources = [...recv].filter(([, c]) => CLIENTS.get(c)!.tagged).map(([r]) => r);
   const tags = new RegExp(String.raw`^(?:${tagSources.length > 0 ? tagSources.join('|') : '(?!)'})\s*${GENERIC}\s*\``);
   for (const [receiver, client] of recv) {
-    const { tagged, methods } = CLIENTS[client];
+    const { tagged, methods } = CLIENTS.get(client)!;
     if (tagged) {
       // slonik's `sql.unsafe\`...\``, `sql.type(Row)\`...\``, `sql.typeAlias('id')\`...\``.
       const re = new RegExp(String.raw`(?<![\w$.])${receiver}\s*(?:\.\s*(?:unsafe|type(?:Alias)?\s*\([^()]*\)))?\s*${GENERIC}\s*\``, 'g');
