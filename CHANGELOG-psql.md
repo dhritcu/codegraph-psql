@@ -15,6 +15,7 @@ Changes in the codegraph-psql fork. Upstream's changes are in `CHANGELOG.md`.
 - A SQL table's trigger list now says it is complete as of the last migration, so you don't have to check later migrations for more.
 - TypeScript and JavaScript code that queries Postgres through Supabase (`.from`, `.rpc`), Knex, Kysely, or a Drizzle `pgTable` now links to the tables and functions it names in your migrations, so `codegraph_explore` follows an API handler into SQL and on to the triggers its writes fire.
 - A client call links to a schema outside its own project only when its package depends on that schema's package or the schema sits in a workspace database package such as `packages/db`, so sibling example apps in one repo no longer link to each other's tables.
+- SQL written in TypeScript and JavaScript strings now links to the tables and functions it touches: `sql` templates from postgres.js, Slonik, Drizzle and Kysely, node-postgres `.query()`, Knex `.raw()`, and Prisma `$queryRaw` / `$executeRaw`, with the operation and the triggers its writes fire.
 
 ### Fixes
 

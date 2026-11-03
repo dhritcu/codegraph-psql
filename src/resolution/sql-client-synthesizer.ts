@@ -124,7 +124,7 @@ function skipString(s: string, i: number): number {
 }
 
 /** Index of the bracket closing the one at `open`, skipping strings; s.length if unbalanced. */
-function closeBracket(s: string, open: number): number {
+export function closeBracket(s: string, open: number): number {
   let depth = 0;
   for (let i = open; i < s.length; i++) {
     const ch = s[i];
@@ -265,7 +265,7 @@ interface FileFacts {
   imports: ImportMapping[];
 }
 
-function importsOf(ctx: ResolutionContext, file: string, safe: string): ImportMapping[] {
+export function importsOf(ctx: ResolutionContext, file: string, safe: string): ImportMapping[] {
   const lang = /\.[cm]?jsx?$/.test(file) ? 'javascript' : file.endsWith('x') ? 'tsx' : 'typescript';
   const mapped = ctx.getImportMappings(file, lang);
   // `const knex = require('knex')` reaches the mappings only in some extractors.
@@ -283,7 +283,7 @@ function importsOf(ctx: ResolutionContext, file: string, safe: string): ImportMa
 }
 
 /** The package a specifier names: `npm:@supabase/supabase-js@2`, `jsr:…` and `https://esm.sh/…@2` as Deno imports them. */
-function packageOf(source: string): string {
+export function packageOf(source: string): string {
   const bare = source.replace(/^(?:npm:|jsr:|https:\/\/(?:esm\.sh|cdn\.skypack\.dev|cdn\.jsdelivr\.net\/npm)\/)/, '');
   const m = /^((?:@[^/@]+\/)?[^/@]+)(?:@[^/]*)?(\/.*)?$/.exec(bare);
   return m ? m[1]! + (m[2] ?? '') : source;
@@ -460,7 +460,7 @@ function receivers(ctx: ResolutionContext, facts: FileFacts, cache: FactsCache):
 // Call sites
 // =============================================================================
 
-interface SqlTarget {
+export interface SqlTarget {
   kind: 'table' | 'function';
   schema: string;
   name: string;
@@ -651,7 +651,7 @@ interface Package {
   dependencies: ReadonlySet<string>;
 }
 
-type PackageCache = Map<string, Package | null>;
+export type PackageCache = Map<string, Package | null>;
 
 const dirOf = (file: string): string => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '');
 
@@ -701,7 +701,7 @@ function sharesSchema(ctx: ResolutionContext, root: string, fromFile: string, pa
  * (`sharesSchema`). Within one series the Postgres resolver picks the live
  * definition, asked from a position after the series' last migration.
  */
-function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: string, packages: PackageCache): Node | null {
+export function resolveTarget(ctx: ResolutionContext, target: SqlTarget, fromFile: string, packages: PackageCache): Node | null {
   const qualifiedName = qualify({ schema: target.schema, name: target.name });
   const defs = ctx.getNodesByQualifiedName(qualifiedName).filter((n) => SQL_LANGUAGES.has(n.language) && n.kind === TARGET_KIND[target.kind]);
   if (defs.length === 0) return null;
@@ -787,7 +787,7 @@ function mergeSite(edge: Edge, site: Site, file: string, line: number, column: n
 }
 
 /** The trigger hops the writes in `edges` fire, from the trigger pass run over them, one write per op. */
-async function triggerHops(queries: QueryBuilder, ctx: ResolutionContext, edges: Edge[], onYield: MaybeYield): Promise<Edge[]> {
+export async function triggerHops(queries: QueryBuilder, ctx: ResolutionContext, edges: Edge[], onYield: MaybeYield): Promise<Edge[]> {
   const writes = new Map<string, Edge[]>();
   const writers = new Set<string>();
   for (const e of edges) {

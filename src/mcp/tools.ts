@@ -4284,24 +4284,26 @@ export class ToolHandler {
   }
 
   /**
-   * Puts the files of a Flow that runs through SQL ahead of every other file
-   * but a named table's write path (`ahead`), in hop order, so the file cap
-   * keeps each hop's body: on a small tier a hop's file otherwise loses its
-   * slot to a view that merely matches a word. A flow with no SQL hop is left
-   * alone.
+   * Puts the files of a Flow that runs through SQL first, in hop order, then
+   * the table write path's files, so the file cap keeps each hop's body: on a
+   * small tier a hop's file otherwise loses its slot to another writer of the
+   * same table or a view that merely matches a word. A Flow with a hop a later
+   * migration dropped or redefined no longer runs, so the live write path
+   * leads instead. A flow with no SQL hop is left alone.
    */
   private leadWithSqlFlow(
     cg: CodeGraph,
     sortedFiles: Array<[string, { nodes: Node[]; score: number; peripheral: number }]>,
     fileGroups: Map<string, { nodes: Node[]; score: number; peripheral: number }>,
     pathNodeIds: Set<string>,
-    ahead: ReadonlySet<string>,
+    writePath: ReadonlySet<string>,
   ): void {
     const byId = cg.getNodesByIds([...pathNodeIds]);
     const hops = [...pathNodeIds].map((id) => byId.get(id)).filter((n): n is Node => !!n);
     if (!hops.some(isSqlNode)) return;
     const top = sortedFiles[0]?.[1].score ?? 0;
-    const lead = sortedFiles.filter(([fp]) => ahead.has(fp));
+    const dead = hops.some((hop) => sqlHistoryNote(cg, hop) !== null);
+    const lead = dead ? sortedFiles.filter(([fp]) => writePath.has(fp)) : [];
     for (const hop of hops) {
       if (isSqlNode(hop) && (hop.kind === 'function' || hop.kind === 'method') && sqlHistoryNote(cg, hop)) continue;
       let group = fileGroups.get(hop.filePath);
@@ -4312,6 +4314,9 @@ export class ToolHandler {
       group.score = Math.max(group.score, top);
       if (!group.nodes.some((n) => n.id === hop.id)) group.nodes.push(hop);
       if (!lead.some(([fp]) => fp === hop.filePath)) lead.push([hop.filePath, group]);
+    }
+    for (const entry of sortedFiles) {
+      if (writePath.has(entry[0]) && !lead.some(([fp]) => fp === entry[0])) lead.push(entry);
     }
     const rest = sortedFiles.filter(([fp]) => !lead.some(([l]) => l === fp));
     sortedFiles.splice(0, sortedFiles.length, ...lead, ...rest);

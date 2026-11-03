@@ -497,7 +497,7 @@ describe('the postgres-ts fixture', () => {
     return text.slice(start, text.indexOf('\n\n', text.indexOf('1. ', start)));
   }
 
-  it('keeps the file of every hop of a SQL flow under the file cap, after the table write path', async () => {
+  it('keeps the file of every hop of a SQL flow under the file cap, ahead of the table write path', async () => {
     fs.cpSync(FIXTURE, dir, { recursive: true });
     const cg = await indexed({
       'api/createOrderReport.ts': 'export function createOrderReport() {\n  return createOrderSummary();\n}\nexport function createOrderSummary() {\n  return 1;\n}\n',
@@ -510,10 +510,34 @@ describe('the postgres-ts fixture', () => {
       });
       const source = text.slice(text.indexOf('**Source Code**'));
       expect([...source.matchAll(/^\*\*`([^`]+)`\*\*/gm)].map((m) => m[1])).toEqual([
-        'supabase/migrations/004_audit.sql',
+        'api/orders.ts',
         'supabase/migrations/002_functions.sql',
+        'supabase/migrations/001_schema.sql',
+        'supabase/migrations/004_audit.sql',
+      ]);
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('keeps every file of a SQL flow under the file cap when the table has writers outside the flow', async () => {
+    fs.cpSync(FIXTURE, dir, { recursive: true });
+    const cg = await indexed({
+      'api/archive.ts': "import { sql } from '../lib/sql';\nexport async function archiveOrdersHandler() {\n  await sql`UPDATE orders SET status = 'archived'`;\n}\n",
+      'api/cancelOrderReport.ts': 'export function cancelOrderReport() {\n  return cancelOrderSummary();\n}\nexport function cancelOrderSummary() {\n  return 1;\n}\n',
+      'api/cancelOrderEmail.ts': 'export function cancelOrderEmail() {\n  return cancelOrderEmailBody();\n}\nexport function cancelOrderEmailBody() {\n  return 2;\n}\n',
+    });
+    try {
+      const text = await tool(cg, 'codegraph_explore', {
+        query: 'cancelOrderHandler orders touch_updated_at cancelOrderReport cancelOrderEmail',
+      });
+      expect(text).toContain('archiveOrdersHandler');
+      const source = text.slice(text.indexOf('**Source Code**'));
+      expect([...source.matchAll(/^\*\*`([^`]+)`\*\*/gm)].map((m) => m[1])).toEqual([
         'api/orders.ts',
         'supabase/migrations/001_schema.sql',
+        'supabase/migrations/002_functions.sql',
+        'supabase/migrations/004_audit.sql',
       ]);
     } finally {
       cg.destroy();

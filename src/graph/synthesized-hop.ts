@@ -99,6 +99,9 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
     case 'sql-client':
       // A database client's call onto the table or function it names: supabase `.from('orders').update`.
       return hop(`${String(m.client ?? 'db client')} ${quoted(m.call, 'a query')}`);
+    case 'sql-embedded':
+      // SQL in a string a database client runs: postgres.js `sql tag`, node-postgres `.query()`.
+      return hop(`${String(m.client ?? 'db client')} ${String(m.call ?? 'query')} ${quoted(m.statement, 'SQL')}`);
     default:
       // redux-thunk, cpp-override, gin-middleware-chain, flutter-build, …
       return hop(by.replace(/-/g, ' '));

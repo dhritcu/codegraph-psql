@@ -2,6 +2,8 @@
   "name": "postgres-ts-fixture",
   "private": true,
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0"
+    "@supabase/supabase-js": "^2.45.0",
+    "pg": "^8.12.0",
+    "postgres": "^3.4.4"
   }
 }
